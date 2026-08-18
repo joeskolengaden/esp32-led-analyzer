@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-host_record.py - records the ESP32 LED Signal Analyzer's serial output to a
-timestamped local log file, so a capture session can be reviewed or diffed
-later instead of only ever being read live off the terminal.
+host_record.py - guided, interactive recording of the ESP32 LED Signal
+Analyzer's captures, tagged with IC name + LED count and cycled through a
+colour sequence you confirm as you set each one on the BBB -- so a saved
+session says what chip and colour every captured frame belongs to, not just
+"here's some serial output from some time." Runs on the HOST (not the
+ESP32); no firmware changes, no WiFi, no credentials on the device.
 
-This runs on the HOST machine (not the ESP32) and just taps the USB-serial
-stream the sketch already prints to -- no firmware changes, no WiFi, no
-credentials on the device itself. That's a deliberate choice: the analyzer
-is always tethered over USB during a capture session (that's how you talk to
-it -- send '1'/'2' to pick a mode), so host-side capture gets you "record
-everything for later" with zero added attack surface on the device.
-
-Usage:
-    .venv/bin/python3 host_record.py --list                 # show serial ports
+Guided mode (default):
     .venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001
-    .venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001 --label tm1814-scope-check
 
-Keystrokes typed at this terminal are forwarded to the ESP32 (so you can still
-send '1'/'2' to pick a capture mode, or any key to return to its menu).
-Ctrl+C stops the recording cleanly and writes a session footer.
+Old passive "just record everything, no prompts" mode is still available:
+    .venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001 --freeform --label whatever
+
+List ports / captured sessions:
+    .venv/bin/python3 host_record.py --list
+    .venv/bin/python3 list_captures.py
 """
 import argparse
 import datetime
@@ -26,6 +23,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 try:
     import serial
@@ -37,9 +35,10 @@ except ImportError:
         "then re-run with .venv/bin/python3 host_record.py ..."
     )
 
+from ic_catalog import IC_CATALOG, SINGLE_WIRE, SPI, DEFAULT_COLOUR_SEQUENCE, expected_byte_count, catalog_names
+from frame_parser import FrameAccumulator
+
 DEFAULT_BAUD = 115200
-# Strip ANSI escape codes if a future sketch revision ever adds color -- the
-# current one doesn't, but this keeps recorded logs plain-text either way.
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -53,7 +52,228 @@ def list_ports():
         print(f"  {p.device}   {p.description}")
 
 
-def record(port_name, baud, out_dir, label):
+def _ask(prompt, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    val = input(f"{prompt}{suffix}: ").strip()
+    return val if val else default
+
+
+def _ask_int(prompt, default=None):
+    while True:
+        raw = _ask(prompt, str(default) if default is not None else None)
+        try:
+            n = int(raw)
+            if n <= 0:
+                print("  Enter a positive number.")
+                continue
+            return n
+        except (TypeError, ValueError):
+            print("  Not a number, try again.")
+
+
+def prompt_ic_selection():
+    names = catalog_names()
+    print("\nKnown ICs:")
+    for i, n in enumerate(names, 1):
+        mode_label = "single-wire" if IC_CATALOG[n]["mode"] == SINGLE_WIRE else "SPI"
+        print(f"  {i:2}) {n}  ({mode_label})")
+    print(f"  {len(names) + 1:2}) other (type a custom name)")
+    while True:
+        choice = input(f"Pick an IC [1-{len(names) + 1}]: ").strip()
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(names):
+                name = names[idx - 1]
+                return name, IC_CATALOG[name]
+            if idx == len(names) + 1:
+                custom = input("Custom IC name: ").strip() or "unknown"
+                mode = _ask("Mode: (1) single-wire or (2) SPI", "1")
+                mode = SINGLE_WIRE if mode not in (SINGLE_WIRE, SPI) else mode
+                return custom, {"mode": mode, "bpp": None, "preamble": 0, "trailer": 0,
+                                 "timing": None, "signature": None, "inverted": False,
+                                 "spi_block": None}
+        print("  Not a valid choice, try again.")
+
+
+def verdict_line(frame, ic, expected_bytes):
+    """One compact line summarizing whether a parsed frame matches what
+    `ic`'s catalog entry expects. Returns (line, passed)."""
+    checks = []
+    passed = True
+    if frame["frame_type"] == "single-wire":
+        if expected_bytes is not None:
+            ok = frame["byte_count"] == expected_bytes
+            passed &= ok
+            checks.append(f"bytes {frame['byte_count']}/{expected_bytes} {'OK' if ok else 'MISMATCH'}")
+        else:
+            checks.append(f"bytes {frame['byte_count']}")
+        want_timing = ic.get("timing")
+        if want_timing:
+            ok = any(want_timing in m for m in frame["timing_matches"])
+            passed &= ok
+            checks.append(f"timing {'OK' if ok else 'NO MATCH'}")
+        if frame["inverted"] is not None and "inverted" in ic:
+            ok = frame["inverted"] == ic["inverted"]
+            passed &= ok
+            checks.append(f"polarity {'OK' if ok else 'WRONG'}")
+        want_sig = ic.get("signature")
+        if want_sig:
+            ok = any(want_sig in s["name"] for s in frame["signature_matches"])
+            passed &= ok
+            checks.append(f"signature {'OK' if ok else 'NOT FOUND'}")
+    else:
+        checks.append(f"bytes {frame['byte_count']}")
+        block = ic.get("spi_block")
+        info = frame["spi_checks"].get(block, {}) if block else {}
+        for k, v in info.items():
+            if "OK" in v or "MISSING" in v or "WRONG" in v:
+                ok = "OK" in v
+                passed &= ok
+                checks.append(f"{k.split('(')[0].strip()} {'OK' if ok else 'FAIL'}")
+    return "    frame: " + " | ".join(checks), passed
+
+
+class SessionState:
+    def __init__(self):
+        self.active_segment = None  # list, or None when not capturing
+        self.lock = threading.Lock()
+
+
+def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes):
+    import json
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_ic = re.sub(r"[^A-Za-z0-9_-]+", "-", ic_name).strip("-") or "ic"
+    session_id = f"{ts}_{safe_ic}"
+    logpath = out_dir / f"session_{session_id}.log"
+    jsonpath = out_dir / f"session_{session_id}.json"
+
+    print(f"\nOpening {port_name} @ {baud} baud...")
+    ser = serial.Serial(port_name, baud, timeout=0.2)
+    start = datetime.datetime.now()
+    log = open(logpath, "w", encoding="utf-8", errors="replace")
+    log.write(f"# ESP32 LED Signal Analyzer -- guided session\n# ic: {ic_name}\n"
+              f"# led_count: {led_count}\n# started: {start.isoformat()}\n"
+              f"# port: {port_name}\n# baud: {baud}\n#{'-' * 60}\n")
+    log.flush()
+
+    mode_name = "single-wire" if ic["mode"] == SINGLE_WIRE else "SPI"
+    exp_bytes = expected_byte_count(ic, led_count)
+    print(f"Selecting {mode_name} mode on the device (sending '{ic['mode']}')...")
+    ser.write(ic["mode"].encode())
+    if ic["mode"] == SPI:
+        print("Reminder: temporarily lower spiSpeed to ~200000 in your FPP config for this test.")
+    if exp_bytes is not None:
+        print(f"Expecting {exp_bytes} bytes/frame for {led_count}x {ic_name} "
+              f"({ic['preamble']} preamble + {ic['bpp']}*{led_count} pixel + {ic['trailer']} trailer).")
+
+    state = SessionState()
+    acc = FrameAccumulator()
+    stop_flag = threading.Event()
+
+    def reader():
+        buf = b""
+        while not stop_flag.is_set():
+            try:
+                chunk = ser.read(256)
+            except serial.SerialException:
+                break
+            if not chunk:
+                continue
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = _ANSI_RE.sub(b"", line).rstrip(b"\r")
+                text = line.decode("utf-8", errors="replace")
+                elapsed = (datetime.datetime.now() - start).total_seconds()
+                log.write(f"[{elapsed:8.3f}s] {text}\n")
+                log.flush()
+                frame = acc.feed(text)
+                if frame is not None:
+                    with state.lock:
+                        if state.active_segment is not None:
+                            line_out, passed = verdict_line(frame, ic, exp_bytes)
+                            frame["_passed"] = passed
+                            print(line_out)
+                            state.active_segment.append(frame)
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    segments = []
+    colours = list(DEFAULT_COLOUR_SEQUENCE)
+    i = 0
+    while i < len(colours):
+        colour_name, rgbw = colours[i]
+        print(f"\n==> Set the {ic_name} string to {colour_name.upper()} "
+              f"(R={rgbw[0]},G={rgbw[1]},B={rgbw[2]},W={rgbw[3]}) on the BBB, "
+              f"then press Enter to start capturing.")
+        input()
+        seg_start = datetime.datetime.now()
+        with state.lock:
+            state.active_segment = []
+        print(f"  Capturing '{colour_name}'... press Enter again once you've seen enough frames.")
+        input()
+        with state.lock:
+            frames = state.active_segment
+            state.active_segment = None
+        seg_end = datetime.datetime.now()
+        pass_count = sum(1 for f in frames if f.get("_passed"))
+        print(f"  -> {len(frames)} frame(s) captured, {pass_count}/{len(frames)} matched expectations.")
+        segments.append({
+            "colour": colour_name, "intended_rgbw": list(rgbw),
+            "started": seg_start.isoformat(), "ended": seg_end.isoformat(),
+            "frame_count": len(frames), "pass_count": pass_count, "frames": frames,
+        })
+        choice = input("  [Enter]=next colour, r=repeat this colour, "
+                        "s=skip remaining defaults, a=add a custom colour, q=end session: ").strip().lower()
+        if choice == "r":
+            continue  # redo same index
+        if choice == "s":
+            break
+        if choice == "a":
+            name = input("    Custom colour name: ").strip() or f"custom{len(colours)}"
+            r = _ask_int("    R", 0)
+            g = _ask_int("    G", 0)
+            b = _ask_int("    B", 0)
+            w = _ask_int("    W (0 if n/a)", 0)
+            colours.insert(i + 1, (name, (r, g, b, w)))
+        if choice == "q":
+            break
+        i += 1
+
+    stop_flag.set()
+    ser.close()
+    end = datetime.datetime.now()
+    duration = (end - start).total_seconds()
+    total_frames = sum(s["frame_count"] for s in segments)
+    total_pass = sum(s["pass_count"] for s in segments)
+
+    log.write(f"#{'-' * 60}\n# ended: {end.isoformat()}\n# duration: {duration:.1f}s\n"
+              f"# colours tested: {len(segments)}\n# frames: {total_frames} ({total_pass} passed)\n")
+    log.close()
+
+    session = {
+        "session_id": session_id, "ic_name": ic_name, "mode": mode_name,
+        "led_count": led_count, "notes": notes, "port": port_name, "baud": baud,
+        "started": start.isoformat(), "ended": end.isoformat(), "duration_s": duration,
+        "expected_bytes_per_frame": exp_bytes, "segments": segments,
+    }
+    with open(jsonpath, "w", encoding="utf-8") as jf:
+        json.dump(session, jf, indent=2)
+
+    print(f"\n{'=' * 60}\nSession summary: {ic_name}  ({led_count} LEDs, {mode_name})")
+    for s in segments:
+        verdict = "OK" if s["frame_count"] and s["pass_count"] == s["frame_count"] else \
+                  ("NO FRAMES" if not s["frame_count"] else "SOME FAILED")
+        print(f"  {s['colour']:<22} {s['pass_count']}/{s['frame_count']} frames  {verdict}")
+    print(f"Saved: {logpath}\n        {jsonpath}")
+
+
+def freeform_record(port_name, baud, out_dir, label):
+    """The original passive mode: record everything, no prompts, no
+    per-IC/colour structure. Still useful for ad-hoc/exploratory capture."""
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"session_{ts}"
@@ -66,12 +286,9 @@ def record(port_name, baud, out_dir, label):
     print(f"Opening {port_name} @ {baud} baud...")
     ser = serial.Serial(port_name, baud, timeout=0.2)
     start = datetime.datetime.now()
-
     log = open(logpath, "w", encoding="utf-8", errors="replace")
-    log.write("# ESP32 LED Signal Analyzer -- recorded session\n")
-    log.write(f"# started : {start.isoformat()}\n")
-    log.write(f"# port    : {port_name}\n")
-    log.write(f"# baud    : {baud}\n")
+    log.write("# ESP32 LED Signal Analyzer -- freeform session\n"
+              f"# started : {start.isoformat()}\n# port    : {port_name}\n# baud    : {baud}\n")
     if label:
         log.write(f"# label   : {label}\n")
     log.write("#" + "-" * 60 + "\n")
@@ -107,12 +324,6 @@ def record(port_name, baud, out_dir, label):
                 line_count += 1
 
     def writer():
-        # Forwards keystrokes typed at this terminal to the ESP32 (menu
-        # selection, "return to menu" keypress) -- unbuffered, one char at a
-        # time, same as a normal serial monitor. Only meaningful when stdin
-        # is a real interactive terminal; skip quietly otherwise (piped,
-        # backgrounded, or run from non-interactive tooling) instead of
-        # crashing on tcgetattr's ioctl failing against a non-TTY fd.
         if not sys.stdin.isatty():
             return
         import tty
@@ -151,9 +362,7 @@ def record(port_name, baud, out_dir, label):
         end = datetime.datetime.now()
         duration = (end - start).total_seconds()
         log.write("#" + "-" * 60 + "\n")
-        log.write(f"# ended    : {end.isoformat()}\n")
-        log.write(f"# duration : {duration:.1f}s\n")
-        log.write(f"# lines    : {line_count}\n")
+        log.write(f"# ended    : {end.isoformat()}\n# duration : {duration:.1f}s\n# lines    : {line_count}\n")
         log.close()
         ser.close()
         print(f"\nStopped. {line_count} lines over {duration:.1f}s -> {logpath}")
@@ -163,21 +372,28 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", "--port", help="serial device, e.g. /dev/cu.usbserial-0001")
     ap.add_argument("-b", "--baud", type=int, default=DEFAULT_BAUD)
-    ap.add_argument("-o", "--out-dir", default="captures", help="directory to write session logs into")
-    ap.add_argument("-l", "--label", help="short label appended to the filename, e.g. tm1814-scope-check")
+    ap.add_argument("-o", "--out-dir", default="captures", help="directory to write session files into")
     ap.add_argument("--list", action="store_true", help="list available serial ports and exit")
+    ap.add_argument("--freeform", action="store_true", help="old passive mode: no prompts, just record everything")
+    ap.add_argument("-l", "--label", help="(--freeform only) short label appended to the filename")
     args = ap.parse_args()
 
     if args.list:
         list_ports()
         return
-
     if not args.port:
         list_ports()
         sys.exit("\nPass -p/--port with one of the ports above.")
 
-    from pathlib import Path
-    record(args.port, args.baud, Path(args.out_dir), args.label)
+    if args.freeform:
+        freeform_record(args.port, args.baud, Path(args.out_dir), args.label)
+        return
+
+    print("=== Guided capture session ===")
+    ic_name, ic = prompt_ic_selection()
+    led_count = _ask_int("LED / pixel count in the test string", 1)
+    notes = input("Session notes (optional, Enter to skip): ").strip()
+    guided_session(args.port, args.baud, Path(args.out_dir), ic_name, ic, led_count, notes)
 
 
 if __name__ == "__main__":

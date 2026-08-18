@@ -121,29 +121,66 @@ Send `1` or `2` over serial to pick a mode; any key returns to the menu.
 
 The sketch itself only prints reports over serial — nothing survives past the
 terminal scrollback unless you capture it. `host_record.py` (host-side, no
-firmware changes) taps that same serial stream and writes it to a timestamped
-local log, forwarding your keystrokes through to the device so you can still
-drive the menu live while it records:
+firmware changes) taps that same serial stream. Its **default mode is a
+guided, interactive session**, not passive recording:
 
 ```bash
 .venv/bin/python3 host_record.py --list                      # find the port
-.venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001 --label tm1814-scope-check
-# ... drive the menu as normal, capture what you need ...
-# Ctrl+C to stop
+.venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001
 ```
 
-Each session writes `captures/session_<timestamp>[_<label>].log`: a header
-(start time, port, baud, label), every line the device printed with a
-per-line elapsed-time stamp, and a footer (end time, duration, line count) —
-plain text, diffable, greppable, safe to paste into an issue or a chat.
+It prompts you through the whole test, and stores exactly what you tell it
+alongside every frame it captures — so a recording answers "what IC, how
+many LEDs, what colour" on its own later, instead of you having to remember
+or reverse-engineer it from a raw byte dump:
+
+1. **Pick the IC** from a numbered list (mirrors `protocols.h`'s timing
+   profiles and `spi_decoders.h`'s SPI chips — see `ic_catalog.py`) or type
+   a custom name. This also auto-sends `1`/`2` to the device to select the
+   right capture mode — one less manual step.
+2. **Enter the LED/pixel count** in your test string. Combined with the IC's
+   known preamble/trailer/bytes-per-pixel, the script computes the *expected*
+   byte count up front and checks every captured frame against it.
+3. **Cycle through colours**, one at a time: it tells you what to set on the
+   BBB (`R=255,G=0,B=0` etc.), waits for Enter once you've set it, then
+   captures until you press Enter again. Every frame captured during that
+   window gets a live one-line verdict:
+   ```
+       frame: bytes 16/16 OK | timing OK | polarity OK | signature OK
+   ```
+   Default sequence is red → green → blue → white/extra-channel → an
+   ascending R/G/B/W pattern → off, matching the single-channel-isolation +
+   ascending-pattern advice from earlier in this session — but at each
+   colour you can `r`epeat, `s`kip the rest, `a`dd a custom colour, or `q`uit
+   early.
+4. **Session summary** at the end: pass/fail per colour, then both files are
+   written — `captures/session_<timestamp>_<ic>.log` (the same human-readable
+   per-line-timestamped format as before) *and* `.json` (structured: IC name,
+   LED count, notes, and every segment's intended colour + parsed frames —
+   see `frame_parser.py` for exactly what gets extracted from each report).
+
+**Retrieving recordings later** — `list_captures.py` reads the `.json`
+sidecars, no need to open files by hand:
+```bash
+python3 list_captures.py                  # every session, newest first
+python3 list_captures.py --ic TM1814       # just that IC
+python3 list_captures.py --failed          # only sessions with a failing colour
+python3 list_captures.py --show <session_id>   # full per-frame detail
+```
+
+**The old passive mode still exists** for ad-hoc capture that doesn't fit
+the guided IC/colour structure (e.g. just watching what comes out while
+debugging something unexpected):
+```bash
+.venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001 --freeform --label whatever
+```
 
 **Why host-side, not on-device:** the analyzer is always tethered over USB
 during a capture session — that's how you send it `1`/`2` in the first place
-— so host-side capture gets "record everything" for free with no added
-firmware complexity and, deliberately, no WiFi credentials or API tokens
-living on a physical device that could be lost or compromised. An on-device
-recorder (flash storage + a retrieval mechanism) would duplicate this for no
-real benefit given the tool's always-USB-tethered design.
+— so host-side capture gets "record everything, structured, retrievable"
+for free with no added firmware complexity and, deliberately, no WiFi
+credentials or API tokens living on a physical device that could be lost or
+compromised.
 
 **Where captures live:** `captures/` in this directory, tracked in this
 folder's own git repo so a capture's history is versioned alongside the
