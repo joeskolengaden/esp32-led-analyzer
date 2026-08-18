@@ -1,0 +1,182 @@
+# ESP32-S3 LED Signal Analyzer
+
+Two capture modes, selected over serial at boot:
+
+- **[1] Single-wire** (RMT RX) — WS281x family, TM1814/TM1829/TM1914 (inverted),
+  UCS7604, UCS8903/8904 (16-bit), WS2805, SM16825E. Reports polarity, T0/T1H/period,
+  classifies the capture against this session's library-consensus tolerance windows
+  (`protocols.h`), and scans the decoded bytes for known preamble/trailer signatures
+  (TM1814/TM1914/UCS7604 preambles, the SM16825E current-gain trailer).
+- **[2] SPI/clocked** (GPIO interrupt) — APA102/SK9822/HD107S, WS2801, P9813,
+  SM16716/SM16726. Reports the raw stream and checks it against every known frame
+  shape (only the real chip's will look sane).
+
+Built to close the loop this session's `fpp-bbb-pixels`/`SPIPixels` work left open:
+the TM1814/TM1829/TM1914 **inverted waveforms have never been watched on a scope**,
+and the P9813/SM16716 SPI framing fixes have never been checked against a real
+capture either — nothing about correctness in software changes that.
+
+## Dependencies
+
+**Firmware (the ESP32 sketch): zero third-party Arduino libraries.** Every
+`#include` across `esp32-led-analyzer.ino`/`protocols.h`/`capture_singlewire.h`/
+`capture_spi.h`/`spi_decoders.h` is either a local project header, a standard C
+header (`stdint.h`, `string.h`), or `driver/rmt_rx.h` — which ships as part of
+the ESP32 board package itself, not a separate Library Manager install.
+
+The only thing to actually install:
+- **Arduino IDE → Boards Manager → search "esp32" → install the Espressif
+  `esp32` package, core version 3.0.0 or newer.** That version bundles the
+  IDF 5 RMT RX driver `capture_singlewire.h` uses; older cores don't have it
+  and the single-wire mode won't compile. Verified in this session against
+  core **3.3.3**.
+- If Boards Manager doesn't already list it, add this URL under
+  **Preferences → Additional Boards Manager URLs** first:
+  `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+- Board selection: any **ESP32-S3** entry (e.g. "ESP32S3 Dev Module"). The
+  RMT RX peripheral and DMA-backed capture buffer this sketch relies on are
+  S3-specific — plain ESP32/S2/C3 boards are not a drop-in swap.
+
+**Host-side recording script (`host_record.py`, optional):** Python 3 +
+[pyserial](https://pypi.org/project/pyserial/). Set up once from this
+directory:
+```bash
+python3 -m venv .venv
+.venv/bin/pip install pyserial
+```
+Nothing else — no GitHub/network libraries, `host_record.py` only opens a
+local serial device and writes local files (see "Recording captures" below).
+
+## Wiring ⚠️ read first
+ESP32-S3 GPIO is **3.3 V and NOT 5 V tolerant** on every pin below.
+
+| Mode | Pin | Source |
+|---|---|---|
+| Single-wire | data → `GPIO4` | BBB output (3.3V) direct, or 5V via level-shifter/divider (1kΩ series, 2kΩ to GND) |
+| SPI | clock → `GPIO5`, data(MOSI) → `GPIO6` | same 3.3V/level-shift rule |
+
+Always share **ground**. Pin numbers are `#define`s at the top of
+`capture_singlewire.h` / `capture_spi.h` if you need to change them.
+
+**SPI mode's real limit:** this is a GPIO-interrupt bit-bang capture, not a
+hardware SPI receiver — reliable to roughly **200-500 kHz**, not the 1-20 MHz
+these chips actually run at. Frame *content* doesn't depend on clock speed, only
+signal integrity does, so **temporarily lower `spiSpeed`** in your SPIPixels
+output config (e.g. to `200000`) while verifying framing here, then restore your
+normal speed once it checks out.
+
+## Testing off-target
+
+`protocols.h` and `spi_decoders.h` have no real hardware dependency beyond a
+printf-capable `Serial`-like object, so they compile and run natively on a
+Mac/Linux dev machine — no ESP32 needed. `test_native/` does exactly that:
+a `HardwareSerial` stub plus two suites feeding known values through the
+*actual* classifier/decoder code, not a reimplementation of it.
+
+```bash
+cd test_native
+c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I.. test_protocols.cpp -o /tmp/tp && /tmp/tp
+c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I.. test_spi_decoders.cpp -o /tmp/ts && /tmp/ts
+```
+
+- `test_protocols.cpp`: every timing profile matches its own reference
+  midpoint, window boundaries are exact (inclusive edges match, one ns
+  outside doesn't), every preamble/trailer signature is detected at its
+  correct position (and *not* at the wrong one), the UCS7604 CFG byte
+  decodes correctly, and a no-match capture reports nearest candidates
+  instead of silence. Also documents a real, non-obvious finding: TM1814's
+  and TM1829's timing windows genuinely overlap (both are Titan-family
+  inverted chips with close datasheet numbers) — timing alone can't always
+  tell them apart, which is exactly why the signature scan exists.
+- `test_spi_decoders.cpp`: round-trips the exact known-good vectors from
+  `plugins/SPIPixels/tests/test_format.cpp` through `spi_check_apa102` /
+  `spi_check_p9813` / `spi_check_ws2801`, confirms the P9813 end-frame
+  length fix scales correctly past 64px, and checks every decoder handles
+  an empty/too-short capture without an out-of-bounds read (run under
+  ASan/UBSan, not just eyeballed). Also caught a real bug this way: the
+  APA102 decoder's pixel-walk couldn't structurally distinguish a genuine
+  white pixel from the trailing all-`0xFF` end frame (both match the same
+  top-3-bits pattern) and was greedily consuming the end frame as an extra
+  "pixel" — fixed by backtracking off a trailing all-`0xFF` run only when
+  the walk consumed every remaining byte.
+- Neither suite proves the RMT/GPIO *capture* itself is correct on real
+  hardware — only that the analysis logic downstream of a capture is. That
+  still needs a real ESP32 and a real signal.
+
+## Build & flash
+**Arduino IDE:** install the *esp32* boards package (Boards Manager, core
+**3.0.0+** — bundles the IDF 5 RMT driver). Select an ESP32-S3 board, open
+`esp32-led-analyzer.ino`, upload.
+
+**arduino-cli** (verified against core 3.3.3):
+```bash
+arduino-cli core install esp32:esp32          # need >=3.0.0
+arduino-cli compile -b esp32:esp32:esp32s3 esp32-led-analyzer
+arduino-cli upload  -b esp32:esp32:esp32s3 -p /dev/ttyACM0 esp32-led-analyzer
+arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
+```
+Send `1` or `2` over serial to pick a mode; any key returns to the menu.
+
+## Recording captures for later analysis
+
+The sketch itself only prints reports over serial — nothing survives past the
+terminal scrollback unless you capture it. `host_record.py` (host-side, no
+firmware changes) taps that same serial stream and writes it to a timestamped
+local log, forwarding your keystrokes through to the device so you can still
+drive the menu live while it records:
+
+```bash
+.venv/bin/python3 host_record.py --list                      # find the port
+.venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001 --label tm1814-scope-check
+# ... drive the menu as normal, capture what you need ...
+# Ctrl+C to stop
+```
+
+Each session writes `captures/session_<timestamp>[_<label>].log`: a header
+(start time, port, baud, label), every line the device printed with a
+per-line elapsed-time stamp, and a footer (end time, duration, line count) —
+plain text, diffable, greppable, safe to paste into an issue or a chat.
+
+**Why host-side, not on-device:** the analyzer is always tethered over USB
+during a capture session — that's how you send it `1`/`2` in the first place
+— so host-side capture gets "record everything" for free with no added
+firmware complexity and, deliberately, no WiFi credentials or API tokens
+living on a physical device that could be lost or compromised. An on-device
+recorder (flash storage + a retrieval mechanism) would duplicate this for no
+real benefit given the tool's always-USB-tethered design.
+
+**Where captures live:** `captures/` in this directory, tracked in this
+folder's own git repo (see below) so a capture's history is versioned
+alongside the exact tool code that produced it. Nothing leaves this machine
+automatically — pushing to the private GitHub backup below is a manual
+`git push` after you have a batch of sessions worth keeping.
+
+## Verification workflow
+1. **Sanity check** with a known-good chip first (e.g. plain WS2811 from a
+   reference generator). Drive a fixed pattern, confirm the printed bytes match
+   and the timing classifies as expected.
+2. **Capture a reference** device's output for the chip under test — record the report.
+3. **Capture the BBB's output**: configure that chip in FPP (Pixel Timing preset
+   + color order per CONFIG.md), output the *same* pattern, feed it in.
+4. **Compare:** polarity, timing-profile match (or how far off if it doesn't
+   match), signature match on any preamble/trailer, and identical byte streams.
+
+**Priority order for this session's open items** — check these first:
+1. **TM1814/TM1829/TM1914 inverted waveform** (single-wire mode): confirm
+   `polarity: INVERTED` prints, timing classifies into the matching profile, and
+   the preamble signature matches (TM1814/TM1914 only — TM1829 has no preamble).
+2. **UCS7604 preamble + CFG byte** (single-wire mode): confirm the 8-byte sync
+   signature matches and the CFG byte decodes to the bit depth you configured.
+3. **SM16825E trailer** (single-wire mode): confirm it appears at the *end* of
+   the frame (not the start) and matches the shipped default (or your edited `g`).
+4. **P9813 end-frame length past 64px** and **SM16716 bit framing** (SPI mode):
+   confirm the pixel-frame count matches what you configured and, for P9813 with
+   >64 pixels, that the end/latch byte count actually grew.
+
+## What "MATCH" means
+Timing windows in `protocols.h` are **library-consensus** windows (what a
+correctly-working implementation actually emits, cross-checked against FastLED/
+NeoPixelBus/WLED in this session's earlier research) — not raw datasheet min/max.
+A datasheet-strict checker would false-flag a correctly working BBB. If nothing
+matches, the tool prints the closest candidates and how far off (as a percentage)
+so you can tell "slightly marginal" from "wrong chip."
