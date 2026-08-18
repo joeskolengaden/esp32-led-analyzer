@@ -14,6 +14,10 @@ returns a parsed dict when a frame is complete, None otherwise.
 """
 import re
 
+# ============================================================================
+# Regexes matched line-by-line against the firmware's printed frame report.
+# Kept 1:1 with the exact printf/println strings -- see module docstring.
+# ============================================================================
 _FRAME_START_RE = re.compile(r"^---- (single-wire|SPI) frame ----$")
 _POLARITY_RE = re.compile(r"^polarity\s*:\s*(.+)$")
 _BITS_SW_RE = re.compile(r"^bits\s*:\s*(\d+)\s*\((\d+) bytes\)$")
@@ -25,6 +29,13 @@ _BYTES_RE = re.compile(r"^bytes\s*:(.*)$")
 _SPI_BLOCK_RE = re.compile(r"^  -- (.+?) framing check --$")
 _SPI_KV_RE = re.compile(r"^\s{4,5}([A-Za-z][A-Za-z0-9/()., ]*?)\s*:\s*(.+)$")
 
+
+# ============================================================================
+# Per-mode parsers: each takes the full list of lines making up one frame
+# report (already delimited by FrameAccumulator) and returns a structured
+# dict. Kept separate since single-wire and SPI reports have different
+# fields entirely.
+# ============================================================================
 
 def _parse_single_wire(lines):
     r = {"frame_type": "single-wire", "polarity_raw": None, "inverted": None,
@@ -85,6 +96,12 @@ def _parse_spi(lines):
                 r["spi_checks"][current_block][m.group(1).strip()] = m.group(2).strip()
     return r
 
+
+# ============================================================================
+# Public entry points: parse_frame() for a complete, already-delimited frame;
+# FrameAccumulator for consuming a live line-by-line serial stream and
+# calling parse_frame() itself once a frame's closing blank line arrives.
+# ============================================================================
 
 def parse_frame(lines):
     """lines: the full text of one frame report, starting with its

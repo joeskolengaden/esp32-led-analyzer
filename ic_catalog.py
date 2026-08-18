@@ -18,9 +18,19 @@ mechanism). `bit_based=True` means the chip isn't byte-granular (SM16716) --
 byte-count sanity-checking is skipped for those, since the real check is bits.
 """
 
+# ============================================================================
+# Mode codes -- same characters the firmware's serial menu expects (send '1'
+# or '2' to pick a capture mode); reused here so host_record.py can
+# auto-select the right mode instead of asking the user to type it in twice.
+# ============================================================================
 SINGLE_WIRE = "1"
 SPI = "2"
 
+# ============================================================================
+# Known-IC picklist. Each entry's mode/timing/signature/spi_block fields are
+# matched (as substrings) against what the firmware actually prints -- see
+# the module docstring above for why that's deliberate.
+# ============================================================================
 IC_CATALOG = {
     "WS2812/WS2811/SK6812 (Normal)": dict(
         mode=SINGLE_WIRE, bpp=3, preamble=0, trailer=0,
@@ -92,13 +102,22 @@ DEFAULT_COLOUR_SEQUENCE = [
 ]
 
 
+# ============================================================================
+# Byte-count sanity check helper, used by host_record.py to compute the
+# expected frame size up front (before any capture happens) and compare
+# every captured frame against it.
+# ============================================================================
+
 def expected_byte_count(ic, led_count):
     """Returns the expected total wire byte count for `ic`'s catalog entry
-    at `led_count` pixels, or None if not computable (bit-based chip, or a
-    variable-length trailer like APA102/P9813's end frame)."""
+    at `led_count` pixels, or None if not computable (bit-based chip, a
+    variable-length trailer like APA102/P9813's end frame, or a custom/
+    "other" IC entered at the prompt with an unknown bytes-per-pixel)."""
     if ic.get("bit_based"):
         return None
     if ic.get("trailer") is None:
+        return None
+    if ic.get("bpp") is None:
         return None
     return ic["preamble"] + ic["trailer"] + ic["bpp"] * led_count
 

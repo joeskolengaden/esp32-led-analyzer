@@ -24,6 +24,7 @@ static volatile size_t      sw_got_symbols = 0;
 static volatile bool        sw_frame_ready = false;
 static rmt_receive_config_t sw_rx_cfg;
 
+// ---- ISR: RMT hardware calls this once a full symbol buffer is ready ----
 static bool IRAM_ATTR sw_on_recv_done(rmt_channel_handle_t ch,
                                        const rmt_rx_done_event_data_t* ed, void* u) {
     if (!sw_frame_ready) {                 // don't clobber an unprocessed frame
@@ -37,6 +38,7 @@ static void sw_arm() {
     rmt_receive(sw_rx_chan, sw_symbols, sizeof(sw_symbols), &sw_rx_cfg);
 }
 
+// ---- Mode lifecycle: called from the .ino's menu handler ----
 static void sw_capture_begin() {
     Serial.printf("\n[single-wire] GPIO%d, %.1f ns/tick, idle-gap %dns ends a frame.\n",
                   SW_DATA_PIN, SW_TICK_NS, SW_RESET_GAP_NS);
@@ -80,7 +82,7 @@ static void sw_capture_poll() {
     size_t n = sw_got_symbols;
     if (n < 8) { sw_frame_ready = false; sw_arm(); return; }  // noise
 
-    // Gather high-phase and low-phase durations across all symbols.
+    // ---- Pass 1: gather high-phase and low-phase durations across all symbols ----
     long hiSum = 0, loSum = 0; int hiN = 0, loN = 0;
     int hiMin = 1 << 30, hiMax = 0, loMin = 1 << 30, loMax = 0;
     for (size_t i = 0; i < n; i++) {
@@ -104,6 +106,8 @@ static void sw_capture_poll() {
     int aMax = inverted ? loMax : hiMax;
     int thresh = (aMin + aMax) / 2;
 
+    // ---- Pass 2: use the threshold from pass 1 to classify each bit-encoding
+    // pulse as a 0 or 1 and pack them into bytes ----
     long t0sum = 0, t1sum = 0; int t0n = 0, t1n = 0;
     static uint8_t bytes[SW_MAX_SYMBOLS / 8];
     int nbits = 0;
@@ -131,6 +135,8 @@ static void sw_capture_poll() {
     int t0Avg = t0n ? (int)(t0sum / t0n) : 0;
     int t1Avg = t1n ? (int)(t1sum / t1n) : 0;
 
+    // ---- Report: measured timing, then hand off to protocols.h for
+    // classification and signature matching ----
     Serial.println("---- single-wire frame ----");
     Serial.printf("polarity : %s\n", inverted ? "INVERTED (idle HIGH) -- TM1814/TM1829/TM1914-style"
                                                : "normal (idle low) -- WS281x-style");

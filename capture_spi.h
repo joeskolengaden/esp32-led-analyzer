@@ -32,6 +32,7 @@ static volatile uint32_t spi_bitcount = 0;
 static volatile uint32_t spi_lastEdgeUs = 0;
 static volatile bool     spi_capturing = false;
 
+// ---- ISR: fires on every CLK rising edge, shifts one DATA bit into spi_bitbuf ----
 static void IRAM_ATTR spi_on_clk_rising() {
     if (spi_bitcount < SPI_MAX_BITS) {
         int bit = digitalRead(SPI_DATA_PIN);
@@ -45,6 +46,7 @@ static void IRAM_ATTR spi_on_clk_rising() {
     spi_capturing = true;
 }
 
+// ---- Mode lifecycle: called from the .ino's menu handler ----
 static void spi_capture_begin() {
     Serial.printf("\n[SPI] CLK=GPIO%d DATA=GPIO%d. Idle %dus ends a frame.\n",
                   SPI_CLK_PIN, SPI_DATA_PIN, SPI_IDLE_TIMEOUT_US);

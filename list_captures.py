@@ -16,6 +16,10 @@ import json
 from pathlib import Path
 
 
+# ============================================================================
+# Loading + pass/fail evaluation
+# ============================================================================
+
 def load_sessions(captures_dir):
     sessions = []
     for jf in sorted(captures_dir.glob("session_*.json"), reverse=True):
@@ -32,6 +36,11 @@ def load_sessions(captures_dir):
 def session_passed(session):
     return all(s["frame_count"] > 0 and s["pass_count"] == s["frame_count"] for s in session.get("segments", []))
 
+
+# ============================================================================
+# Display: a compact one-line-per-session table, and a full per-frame detail
+# view for a single session (--show)
+# ============================================================================
 
 def print_table(sessions):
     if not sessions:
@@ -66,7 +75,7 @@ def print_detail(session):
     for seg in session.get("segments", []):
         verdict = "OK" if seg["frame_count"] and seg["pass_count"] == seg["frame_count"] else \
                   ("NO FRAMES" if not seg["frame_count"] else "SOME FAILED")
-        rgbw = seg.get("intended_rgbw", [])
+        rgbw = seg.get("intended_rgbw") or []  # None for the synthetic "(interrupted)" segment
         print(f"  {seg['colour']:<22} R={rgbw[0] if len(rgbw)>0 else '?'} "
               f"G={rgbw[1] if len(rgbw)>1 else '?'} B={rgbw[2] if len(rgbw)>2 else '?'} "
               f"W={rgbw[3] if len(rgbw)>3 else '?'}   {seg['pass_count']}/{seg['frame_count']} frames  {verdict}")
@@ -80,6 +89,11 @@ def print_detail(session):
             else:
                 print(f"      bytes={f.get('bytes_hex', '')}")
 
+
+# ============================================================================
+# CLI entry point: --show for one session's detail, otherwise the filtered
+# table (--ic / --failed narrow it down)
+# ============================================================================
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
