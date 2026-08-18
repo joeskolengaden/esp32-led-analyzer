@@ -146,10 +146,16 @@ recorder (flash storage + a retrieval mechanism) would duplicate this for no
 real benefit given the tool's always-USB-tethered design.
 
 **Where captures live:** `captures/` in this directory, tracked in this
-folder's own git repo (see below) so a capture's history is versioned
-alongside the exact tool code that produced it. Nothing leaves this machine
-automatically — pushing to the private GitHub backup below is a manual
-`git push` after you have a batch of sessions worth keeping.
+folder's own git repo so a capture's history is versioned alongside the
+exact tool code that produced it — and backed up to a **private** GitHub
+repo, [joeskolengaden/esp32-led-analyzer](https://github.com/joeskolengaden/esp32-led-analyzer).
+Nothing leaves this machine automatically; recording writes local files
+only. When you have a batch of sessions worth keeping:
+```bash
+git add captures/
+git commit -m "captures: <what you were checking>"
+git push
+```
 
 ## Verification workflow
 1. **Sanity check** with a known-good chip first (e.g. plain WS2811 from a
