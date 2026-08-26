@@ -25,9 +25,14 @@
  * Wiring: see capture_singlewire.h / capture_spi.h for pin numbers.
  * *** 3.3V ONLY on every input pin *** -- level-shift any 5V source first
  * (e.g. 1k from source to pin, 2k from pin to GND).
+ *
+ * Optional WiFi (wifi_setup.h): send 'w' at this menu to scan/join/save a
+ * network. Never triggered automatically -- see wifi_setup.h for why, and
+ * for the credential-storage and RMT-timing caveats worth reading first.
  */
 #include "capture_singlewire.h"
 #include "capture_spi.h"
+#include "wifi_setup.h"
 
 enum Mode { MODE_MENU, MODE_SINGLEWIRE, MODE_SPI };
 static Mode mode = MODE_MENU;
@@ -39,7 +44,12 @@ static void print_menu() {
     Serial.println("!! (pin->GND) does the same job for a few cents. Don't feed 5V in unshifted.");
     Serial.println("  1) Single-wire capture (WS281x family, TM1814/1829/1914, UCS7604, WS2805, SM16825E...)");
     Serial.println("  2) SPI capture (APA102/SK9822/HD107S, WS2801, P9813, SM16716/SM16726)");
-    Serial.println("Send 1 or 2 to start. While capturing, send any key to return here.\n");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi: connected (%s, %s)\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("WiFi: not connected");
+    }
+    Serial.println("Send 1 or 2 to start, or 'w' for WiFi setup. While capturing, send any key to return here.\n");
 }
 
 void setup() {
@@ -54,6 +64,7 @@ void loop() {
             char c = Serial.read();
             if (c == '1') { mode = MODE_SINGLEWIRE; sw_capture_begin(); }
             else if (c == '2') { mode = MODE_SPI; spi_capture_begin(); }
+            else if (c == 'w') { wifi_setup_menu(); print_menu(); }
         }
         return;
     }

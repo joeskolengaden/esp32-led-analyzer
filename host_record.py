@@ -5,7 +5,9 @@ Analyzer's captures, tagged with IC name + LED count and cycled through a
 colour sequence you confirm as you set each one on the BBB -- so a saved
 session says what chip and colour every captured frame belongs to, not just
 "here's some serial output from some time." Runs on the HOST (not the
-ESP32); no firmware changes, no WiFi, no credentials on the device.
+ESP32) and never touches WiFi or credentials itself -- the firmware's
+optional WiFi join (wifi_setup.h, 'w' at the boot menu) is a separate,
+opt-in thing this script neither requires nor knows about.
 
 Guided mode (default):
     .venv/bin/python3 host_record.py -p /dev/cu.usbserial-0001

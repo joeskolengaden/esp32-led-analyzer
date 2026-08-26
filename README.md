@@ -34,9 +34,13 @@ flowchart LR
 
 **Firmware (the ESP32 sketch): zero third-party Arduino libraries.** Every
 `#include` across `esp32-led-analyzer.ino`/`protocols.h`/`capture_singlewire.h`/
-`capture_spi.h`/`spi_decoders.h` is either a local project header, a standard C
-header (`stdint.h`, `string.h`), or `driver/rmt_rx.h` — which ships as part of
+`capture_spi.h`/`spi_decoders.h`/`wifi_setup.h` is either a local project
+header, a standard C header (`stdint.h`, `string.h`), or one of
+`driver/rmt_rx.h` / `WiFi.h` / `Preferences.h` — all three ship as part of
 the ESP32 board package itself, not a separate Library Manager install.
+Pulling in the WiFi/TLS stack does grow the compiled sketch noticeably
+(23% → 67% of flash on a typical ESP32-S3's 1.3MB partition) — still
+comfortably within budget, just worth knowing if you're board-shopping.
 
 The only thing to actually install:
 - **Arduino IDE → Boards Manager → search "esp32" → install the Espressif
@@ -186,6 +190,61 @@ arduino-cli upload  -b esp32:esp32:esp32s3 -p /dev/ttyACM0 esp32-led-analyzer
 arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
 ```
 Send `1` or `2` over serial to pick a mode; any key returns to the menu.
+
+## WiFi setup (optional)
+
+Send **`w`** at the boot menu to scan for networks, join one, and save it
+for next boot — all over the same Serial console, no new hardware or app
+needed:
+
+```
+=== WiFi setup ===
+Saved networks:
+  1) HomeNet
+  f) forget all saved networks
+  s) scan for networks
+  (anything else, or 10s of silence) = back to the main menu, no changes
+> s
+[WiFi] Scanning...
+Networks found:
+   1) HomeNet                          RSSI  -52  secured
+   2) Neighbor5G                       RSSI  -71  secured
+Pick a number, or Enter to cancel: 1
+Password for "HomeNet": ••••••••
+[WiFi] Connecting to "HomeNet"........
+[WiFi] Connected. IP: 192.168.1.47
+Save this network for next time? [Y/n]: y
+[WiFi] Saved.
+```
+
+Up to 5 saved networks are kept (oldest dropped first once full); pick one
+by number next time instead of typing the password again. The main menu
+always shows current WiFi status (`WiFi: connected (SSID, IP)` or
+`WiFi: not connected`) so you don't have to open the WiFi menu just to check.
+
+**Why `w` and not an automatic prompt at boot:** `host_record.py` sends `1`
+or `2` immediately after opening the serial port, every single session,
+with no idea a WiFi option exists. An auto-prompt here would eat that first
+keystroke and break the analyzer's core interface on *every* connection,
+not just the ones where you actually want WiFi — so this only ever runs on
+an explicit `w`.
+
+**Two things worth knowing before you use it:**
+- **Credentials are stored in plain ESP32 NVS** (via `Preferences`), not
+  encrypted at rest unless you've separately enabled ESP32 flash encryption
+  (a whole-device provisioning step this sketch doesn't turn on for you).
+  This bench tool now carries your WiFi password if it's lost, stolen, or
+  handed to someone else — the exact tradeoff this project avoided by
+  design until now (see "Why host-side, not on-device" below). Send `w`
+  then `f` to forget every saved network before lending the board out.
+- **WiFi radio activity can perturb nanosecond-precision RMT captures** —
+  a documented ESP32 WiFi/RMT coexistence effect, not specific to this
+  sketch. If a single-wire capture looks unexpectedly jittery, try without
+  an active WiFi connection before trusting the timing numbers.
+
+This only covers *joining* a network — nothing in this sketch currently
+sends a capture anywhere over that connection; every capture still only
+ever leaves the device over USB serial to `host_record.py`, same as before.
 
 ## Recording captures for later analysis
 
@@ -483,9 +542,11 @@ debugging something unexpected):
 **Why host-side, not on-device:** the analyzer is always tethered over USB
 during a capture session — that's how you send it `1`/`2` in the first place
 — so host-side capture gets "record everything, structured, retrievable"
-for free with no added firmware complexity and, deliberately, no WiFi
-credentials or API tokens living on a physical device that could be lost or
-compromised.
+for free with no added firmware complexity. This was originally a *no*
+WiFi/no on-device credentials design, full stop; the optional "WiFi setup"
+above changes that if you turn it on (see its "two things worth knowing"
+before you do) — capture recording itself still only ever happens
+host-side, unchanged, regardless of whether WiFi is joined.
 
 **Where captures live:** `captures/` in this directory, tracked in this
 folder's own git repo so a capture's history is versioned alongside the
