@@ -57,6 +57,40 @@ def list_ports():
 
 
 # ============================================================================
+# Wiring safety gate. This is NOT a substitute for actual overvoltage
+# protection -- no firmware or host-side code can make an ESP32-S3 GPIO pin
+# (3.3V absolute max) safe against a genuine 5V signal; that's a hardware
+# fact, not a software one. What this CAN do is make sure nobody starts a
+# capture without having deliberately thought about it, and make clear that
+# "I don't have a level shifter" usually isn't actually a blocker: a plain
+# 1k/2k resistor divider does the same job as a commercial level-shifter
+# module for a few cents, and some BBB cape designs expose a 3.3V-logic tap
+# point before their own onboard buffer/level-shifter chip -- meaning zero
+# extra parts may be needed at all if you can wire to that point instead.
+# ============================================================================
+
+def confirm_wiring_safety():
+    print("\n" + "!" * 70)
+    print("! ESP32-S3 GPIO is 3.3V ONLY. A bare 5V data/clock line WILL damage it.")
+    print("! You do NOT need a commercial level-shifter module for this -- any")
+    print("! one of these is enough, cheapest first:")
+    print("!   1) Tap a 3.3V-logic point in the signal chain instead, if your")
+    print("!      cape/board exposes the driver's output BEFORE its own 5V")
+    print("!      buffer chip (check your board's schematic/silkscreen).")
+    print("!   2) A 2-resistor divider: 1k from the source to the GPIO pin,")
+    print("!      2k from that same pin to GND. ~$0.02 in parts, no chip needed.")
+    print("!   3) A real level-shifter module (74HCT245, TXB0108, etc.) if you")
+    print("!      have one -- functionally equivalent to (2) for this purpose.")
+    print("! Wiring 5V straight into GPIO4/5/6 with none of the above WILL risk")
+    print("! frying the board. See the README's Wiring section for details.")
+    print("!" * 70)
+    ans = input("Type 'yes' to confirm your signal is 3.3V-safe (shifted, divided, or\n"
+                "already 3.3V logic) and continue: ").strip().lower()
+    if ans != "yes":
+        sys.exit("\nStopped -- wiring not confirmed. Nothing was opened or captured.")
+
+
+# ============================================================================
 # Small interactive-prompt helpers, shared by both guided and freeform modes
 # ============================================================================
 
@@ -575,6 +609,8 @@ def main():
                      help="skip the auto-detect sniff, go straight to the manual IC/LED-count prompts")
     ap.add_argument("--detect-seconds", type=float, default=3.0,
                      help="how long to listen per mode during auto-detect (default 3s)")
+    ap.add_argument("--wiring-confirmed", action="store_true",
+                     help="skip the 3.3V wiring-safety prompt (once you've confirmed it for this setup)")
     args = ap.parse_args()
 
     if args.list:
@@ -583,6 +619,9 @@ def main():
     if not args.port:
         list_ports()
         sys.exit("\nPass -p/--port with one of the ports above.")
+
+    if not args.wiring_confirmed:
+        confirm_wiring_safety()
 
     if args.freeform:
         freeform_record(args.port, args.baud, Path(args.out_dir), args.label)

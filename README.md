@@ -62,15 +62,49 @@ Nothing else — no GitHub/network libraries, `host_record.py` only opens a
 local serial device and writes local files (see "Recording captures" below).
 
 ## Wiring ⚠️ read first
-ESP32-S3 GPIO is **3.3 V and NOT 5 V tolerant** on every pin below.
+ESP32-S3 GPIO is **3.3 V and NOT 5 V tolerant** on every pin below — this is
+a hard voltage-rating limit, not something firmware or host-side code can
+compensate for. **You do not need a commercial level-shifter module for
+this**, though — cheapest option first:
+
+1. **Tap a 3.3V-logic point instead, if one exists.** Some BBB cape designs
+   drive the pixel port through their own onboard 5V buffer/level-shifter
+   chip (e.g. a 74HCT245) — if yours does, the PRU/GPIO pin *before* that
+   chip is often still exposed and is native 3.3V logic already, needing no
+   extra parts at all. Check your board's schematic/silkscreen.
+2. **A 2-resistor divider — no chip, no module, ~$0.02 in parts.** This is
+   the default assumption below and in the tool's own safety prompt.
+3. **A real level-shifter module** (74HCT245, TXB0108, etc.), if you happen
+   to have one — functionally equivalent to (2) for this purpose, no better.
+
+```
+   5V source ──1kΩ──┬── ESP32-S3 GPIO pin (sees ~3.3V)
+                     │
+                    2kΩ
+                     │
+                    GND
+```
+The divider drops a 5V swing to `5V × 2kΩ/(1kΩ+2kΩ) ≈ 3.33V` — inside the
+GPIO's safe input range with margin. Exact resistor values aren't critical;
+any pair in roughly a 1:2 ratio (1k/2k, 10k/20k, whatever's in a junk-drawer
+kit) works the same way. If your source is already 3.3V logic (common when
+tapping before a buffer chip, or on some native-3.3V BBB setups), skip the
+divider entirely — it's not needed and doesn't hurt, either.
 
 | Mode | Pin | Source |
 |---|---|---|
-| Single-wire | data → `GPIO4` | BBB output (3.3V) direct, or 5V via level-shifter/divider (1kΩ series, 2kΩ to GND) |
-| SPI | clock → `GPIO5`, data(MOSI) → `GPIO6` | same 3.3V/level-shift rule |
+| Single-wire | data → `GPIO4` | 3.3V direct, or divided/shifted down from 5V per above |
+| SPI | clock → `GPIO5`, data(MOSI) → `GPIO6` | same rule |
 
 Always share **ground**. Pin numbers are `#define`s at the top of
 `capture_singlewire.h` / `capture_spi.h` if you need to change them.
+
+**The tool won't let you skip this by accident:** every run of
+`host_record.py` (guided or `--freeform`) opens with a wiring-safety prompt
+that requires typing `yes` before it touches the serial port at all — pass
+`--wiring-confirmed` to skip it on repeat runs once you've verified your
+setup. The firmware's own boot menu prints the same reminder every time it
+returns to the menu, regardless of which tool is talking to it.
 
 ```mermaid
 flowchart LR
@@ -87,9 +121,9 @@ flowchart LR
         G6["GPIO6"]
         GND["GND"]
     end
-    SWOUT -- "direct 3.3V,\nor level-shift if 5V" --> G4
-    CLKOUT -- "direct 3.3V,\nor level-shift if 5V" --> G5
-    DATAOUT -- "direct 3.3V,\nor level-shift if 5V" --> G6
+    SWOUT -- "3.3V direct, or\n1k/2k divider if 5V" --> G4
+    CLKOUT -- "3.3V direct, or\n1k/2k divider if 5V" --> G5
+    DATAOUT -- "3.3V direct, or\n1k/2k divider if 5V" --> G6
     BBB_SW -.->|shared ground| GND
     BBB_SPI -.->|shared ground| GND
 ```
@@ -182,7 +216,9 @@ like when it's wrong or ambiguous.
 
 ```mermaid
 flowchart TD
-    Start(["run host_record.py"]) --> Detect{"auto-detect:\nlisten in single-wire mode,\nthen SPI mode\n(a few seconds each)"}
+    Start(["run host_record.py"]) --> WiringGate{"type 'yes' to confirm\n3.3V-safe wiring\n(--wiring-confirmed to skip)"}
+    WiringGate -->|no / anything else| Abort(["exits -- nothing\nopened or captured"])
+    WiringGate -->|yes| Detect{"auto-detect:\nlisten in single-wire mode,\nthen SPI mode\n(a few seconds each)"}
     Detect -->|signal found| Suggest["show ranked IC + LED-count\nguesses from the timing/\nsignature/byte-count evidence"]
     Suggest --> Confirm{"you: accept / pick\na different guess / m=manual"}
     Confirm -->|accept or pick| ConfirmLED["confirm / adjust the\nguessed LED count"]
@@ -229,6 +265,8 @@ sequenceDiagram
     participant ESP as ESP32-S3
 
     You->>Tool: run with -p /dev/cu.usbserial-...
+    Tool->>You: 3.3V wiring-safety prompt (blocks until answered)
+    You->>Tool: "yes" (or --wiring-confirmed skips this)
     Tool->>ESP: sends '1' (try single-wire mode)
     alt signal seen within a few seconds
         ESP-->>Tool: frame report
@@ -271,6 +309,23 @@ sequenceDiagram
 **What it actually looks like on screen** — a real (abbreviated) transcript, exactly as printed, for a 50-pixel TM1814 string that was already plugged in and driving a test pattern when the tool started. `-->` marks where you type something and press Enter; everything else is what the tool prints:
 
 ```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! ESP32-S3 GPIO is 3.3V ONLY. A bare 5V data/clock line WILL damage it.
+! You do NOT need a commercial level-shifter module for this -- any
+! one of these is enough, cheapest first:
+!   1) Tap a 3.3V-logic point in the signal chain instead, if your
+!      cape/board exposes the driver's output BEFORE its own 5V
+!      buffer chip (check your board's schematic/silkscreen).
+!   2) A 2-resistor divider: 1k from the source to the GPIO pin,
+!      2k from that same pin to GND. ~$0.02 in parts, no chip needed.
+!   3) A real level-shifter module (74HCT245, TXB0108, etc.) if you
+!      have one -- functionally equivalent to (2) for this purpose.
+! Wiring 5V straight into GPIO4/5/6 with none of the above WILL risk
+! frying the board. See the README's Wiring section for details.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Type 'yes' to confirm your signal is 3.3V-safe (shifted, divided, or
+already 3.3V logic) and continue: --> yes
+
 === Guided capture session ===
 
 Listening for a signal (3s per mode, single-wire then SPI)...
