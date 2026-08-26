@@ -57,8 +57,10 @@ def print_table(sessions):
         print(f"{trunc(s.get('session_id', '?'), 28):<28} {trunc(s.get('ic_name', '?'), 26):<26} "
               f"{s.get('led_count', '?'):>5} {s.get('mode', '?'):<12} "
               f"{len(s.get('segments', [])):<8} {verdict}")
+        co = s.get("color_order")
+        order_note = f"  |  colour order: {co['order']}" if co else ""
         if colours:
-            print(f"    colours: {colours}")
+            print(f"    colours: {colours}{order_note}")
 
 
 def print_detail(session):
@@ -70,6 +72,9 @@ def print_detail(session):
     print(f"started    : {session.get('started')}")
     print(f"duration   : {session.get('duration_s'):.1f}s" if session.get("duration_s") is not None else "")
     print(f"expected bytes/frame: {session.get('expected_bytes_per_frame')}")
+    co = session.get("color_order")
+    if co:
+        print(f"colour order: {co['order']}{'' if co.get('user_confirmed') else ' (user-corrected)'}")
     print(f"log file   : {session['_path'].with_suffix('.log')}")
     print()
     for seg in session.get("segments", []):

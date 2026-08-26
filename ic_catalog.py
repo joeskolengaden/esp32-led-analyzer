@@ -33,8 +33,23 @@ SPI = "2"
 # the module docstring above for why that's deliberate.
 # ============================================================================
 IC_CATALOG = {
-    "WS2812/WS2811/SK6812 (Normal)": dict(
+    "WS2812/WS2811/SK6812/WS2813/WS2815/GS8208 (Normal, 3ch)": dict(
+        # All genuinely share identical wire timing and byte shape -- WS2813's
+        # backup data line is a second physical pin invisible on a single-wire
+        # capture, and WS2815's 12V rail isn't observable from logic-level
+        # data at all. Kept as ONE combined entry (matching this catalog's
+        # existing convention for APA104/106/PL9823/SK6822 below) rather than
+        # separate near-duplicates, so a real detection doesn't waste its
+        # ranked-guess slots on names that are provably indistinguishable
+        # from a capture -- see the auto-detect section of the README.
         mode=SINGLE_WIRE, bpp=3, preamble=0, trailer=0,
+        timing="Normal/WS281x-family", signature=None, inverted=False),
+    "SK6812 RGBW (Normal, 4ch)": dict(
+        # Same timing family as its 3-byte siblings above, but wired for
+        # 4 bytes/pixel (adds a white channel) -- the byte-count arithmetic
+        # check is what actually separates it; timing alone can't (and
+        # isn't expected to).
+        mode=SINGLE_WIRE, bpp=4, preamble=0, trailer=0,
         timing="Normal/WS281x-family", signature=None, inverted=False),
     "APA104/APA106/PL9823/SK6822": dict(
         mode=SINGLE_WIRE, bpp=3, preamble=0, trailer=0,

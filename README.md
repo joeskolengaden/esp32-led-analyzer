@@ -416,11 +416,29 @@ capture, so here's what each field means and what a real failure looks like:
    ascending-pattern advice from earlier in this session — but at each
    colour you can `r`epeat, `s`kip the rest, `a`dd a custom colour, or `q`uit
    early.
-4. **Session summary** at the end: pass/fail per colour, then both files are
-   written — `captures/session_<timestamp>_<ic>.log` (the same human-readable
+4. **Colour order check** (single-wire only, skipped if the session was
+   interrupted): once red/green/blue (and white, for 4-channel ICs) have
+   been captured, the tool already knows both what channel you set on the
+   BBB *and* which wire byte position actually lit up brightest for it — so
+   it can work out the wire order (e.g. `GRB` vs `RGB`) directly, no
+   firmware change needed. It always asks before recording anything:
+   ```
+   Inferred wire colour order from the red/green/blue captures: GRB
+     Is GRB correct? [Y]es / n=let me correct it / s=skip, don't record:
+   ```
+   `n` lets you type the real order yourself if the guess is wrong; either
+   way nothing is written to the session unless you confirm or correct it.
+   If the captures were too ambiguous to say anything (dim/near-tied bytes,
+   two colours pointing at the same position), it says so and moves on
+   rather than guessing blind — see `color_analysis.py` for exactly what
+   counts as "clean enough" evidence.
+5. **Session summary** at the end: pass/fail per colour (and the confirmed
+   colour order, if any), then both files are written —
+   `captures/session_<timestamp>_<ic>.log` (the same human-readable
    per-line-timestamped format as before) *and* `.json` (structured: IC name,
-   LED count, notes, and every segment's intended colour + parsed frames —
-   see `frame_parser.py` for exactly what gets extracted from each report).
+   LED count, notes, colour order, and every segment's intended colour +
+   parsed frames — see `frame_parser.py` for exactly what gets extracted
+   from each report).
 
 **Auto-detect: how the guess is made, and its real limits.** It tries
 single-wire mode first, listens for a few seconds (`--detect-seconds`,

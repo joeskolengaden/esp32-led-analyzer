@@ -37,6 +37,7 @@ except ImportError:
 
 from ic_catalog import IC_CATALOG, SINGLE_WIRE, SPI, DEFAULT_COLOUR_SEQUENCE, expected_byte_count, catalog_names, guess_ics
 from frame_parser import FrameAccumulator
+from color_analysis import infer_color_order
 
 DEFAULT_BAUD = 115200
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;]*[a-zA-Z]")  # strips any future colour codes from device output
@@ -462,16 +463,42 @@ def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes, ser=
         total_frames = sum(s["frame_count"] for s in segments)
         total_pass = sum(s["pass_count"] for s in segments)
 
+        # ---- Colour-order inference: single-wire only, and only on a
+        # completed (non-interrupted) session -- see color_analysis.py for
+        # why this is scoped to bpp 3/4. Always asks before recording
+        # anything; a plain "s" (or declining otherwise) records nothing. ----
+        color_order_result = None
+        if not interrupted and ic["mode"] == SINGLE_WIRE:
+            guess, detail = infer_color_order(segments, ic.get("bpp"))
+            if guess:
+                white_note = "/white" if ic.get("bpp") == 4 else ""
+                print(f"\nInferred wire colour order from the red/green/blue{white_note} "
+                      f"captures: {guess}")
+                ans = input(f"  Is {guess} correct? [Y]es / n=let me correct it / "
+                             f"s=skip, don't record: ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    color_order_result = {"order": guess, "user_confirmed": True, "evidence": detail}
+                elif ans in ("n", "no"):
+                    corrected = input("  Type the correct order (e.g. RGB, GRB, RGBW): ").strip().upper()
+                    if corrected:
+                        color_order_result = {"order": corrected, "user_confirmed": False,
+                                               "tool_guess": guess, "evidence": detail}
+            else:
+                print(f"\nCouldn't infer a wire colour order: {detail}")
+
         log.write(f"#{'-' * 60}\n# ended: {end.isoformat()}\n# duration: {duration:.1f}s\n"
                   f"# interrupted: {interrupted}\n"
                   f"# colours tested: {len(segments)}\n# frames: {total_frames} ({total_pass} passed)\n")
+        if color_order_result:
+            log.write(f"# colour_order: {color_order_result['order']}"
+                       f"{'' if color_order_result['user_confirmed'] else ' (user-corrected)'}\n")
         log.close()
 
         session = {
             "session_id": session_id, "ic_name": ic_name, "mode": mode_name,
             "led_count": led_count, "notes": notes, "port": port_name, "baud": baud,
             "started": start.isoformat(), "ended": end.isoformat(), "duration_s": duration,
-            "interrupted": interrupted,
+            "interrupted": interrupted, "color_order": color_order_result,
             "expected_bytes_per_frame": exp_bytes, "segments": segments,
         }
         with open(jsonpath, "w", encoding="utf-8") as jf:
@@ -483,6 +510,9 @@ def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes, ser=
             verdict = "OK" if s["frame_count"] and s["pass_count"] == s["frame_count"] else \
                       ("NO FRAMES" if not s["frame_count"] else "SOME FAILED")
             print(f"  {s['colour']:<22} {s['pass_count']}/{s['frame_count']} frames  {verdict}")
+        if color_order_result:
+            print(f"  colour order: {color_order_result['order']}"
+                  f"{'' if color_order_result['user_confirmed'] else ' (corrected by you)'}")
         print(f"Saved: {logpath}\n        {jsonpath}")
 
 
