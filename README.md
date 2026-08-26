@@ -16,6 +16,20 @@ the TM1814/TM1829/TM1914 **inverted waveforms have never been watched on a scope
 and the P9813/SM16716 SPI framing fixes have never been checked against a real
 capture either — nothing about correctness in software changes that.
 
+```mermaid
+flowchart LR
+    BBB["FPP / BeagleBone\n(pixel string output)"]
+    ESP["ESP32-S3\ncapture + decode\n(protocols.h / spi_decoders.h)"]
+    Host["host_record.py\n(host computer, USB serial)"]
+    Files["captures/\nsession_*.log + .json"]
+    List["list_captures.py\n(retrieve later)"]
+
+    BBB -- "single-wire data,\nor SPI clock+data" --> ESP
+    ESP -- "frame report\n(printed over Serial)" --> Host
+    Host -- "tagged with IC name,\nLED count, colour" --> Files
+    Files --> List
+```
+
 ## Dependencies
 
 **Firmware (the ESP32 sketch): zero third-party Arduino libraries.** Every
@@ -57,6 +71,28 @@ ESP32-S3 GPIO is **3.3 V and NOT 5 V tolerant** on every pin below.
 
 Always share **ground**. Pin numbers are `#define`s at the top of
 `capture_singlewire.h` / `capture_spi.h` if you need to change them.
+
+```mermaid
+flowchart LR
+    subgraph BBB_SW["BBB — single-wire chips"]
+        SWOUT["data out"]
+    end
+    subgraph BBB_SPI["BBB — SPI chips"]
+        CLKOUT["clock out"]
+        DATAOUT["data(MOSI) out"]
+    end
+    subgraph ESP["ESP32-S3"]
+        G4["GPIO4"]
+        G5["GPIO5"]
+        G6["GPIO6"]
+        GND["GND"]
+    end
+    SWOUT -- "direct 3.3V,\nor level-shift if 5V" --> G4
+    CLKOUT -- "direct 3.3V,\nor level-shift if 5V" --> G5
+    DATAOUT -- "direct 3.3V,\nor level-shift if 5V" --> G6
+    BBB_SW -.->|shared ground| GND
+    BBB_SPI -.->|shared ground| GND
+```
 
 **SPI mode's real limit:** this is a GPIO-interrupt bit-bang capture, not a
 hardware SPI receiver — reliable to roughly **200-500 kHz**, not the 1-20 MHz
@@ -134,6 +170,73 @@ alongside every frame it captures — so a recording answers "what IC, how
 many LEDs, what colour" on its own later, instead of you having to remember
 or reverse-engineer it from a raw byte dump:
 
+```mermaid
+flowchart TD
+    Start(["run host_record.py"]) --> PickIC["Pick IC from numbered list\n(or type a custom name)"]
+    PickIC --> AutoMode["tool auto-sends '1' or '2'\nto select capture mode"]
+    AutoMode --> LEDCount["Enter LED / pixel count"]
+    LEDCount --> Notes["Enter session notes\n(optional)"]
+    Notes --> ExpBytes["tool prints expected\nbytes/frame"]
+    ExpBytes --> Loop
+
+    subgraph Loop["colour-cycling loop, one colour at a time"]
+        direction TD
+        Prompt["tool: 'Set string to RED\n(R=255,G=0,B=0), press Enter'"] --> UserSets["you set that colour\non the BBB, press Enter"]
+        UserSets --> Capture["tool captures frames,\nprints a live verdict per frame:\nbytes OK | timing OK | polarity OK | signature OK"]
+        Capture --> UserEnter["you press Enter again\nto stop this colour"]
+        UserEnter --> Choice{"choose:"}
+        Choice -->|Enter| Next["next colour"]
+        Choice -->|r| Prompt
+        Choice -->|s| SkipAll["skip remaining defaults"]
+        Choice -->|a| AddCustom["add a custom colour,\ninsert into sequence"]
+        Choice -->|q| QuitEarly["end session now"]
+        AddCustom --> Next
+        Next --> Prompt
+    end
+
+    Loop --> Summary["Session summary:\npass/fail per colour"]
+    Summary --> SaveFiles["writes\ncaptures/session_TIMESTAMP_IC.log\ncaptures/session_TIMESTAMP_IC.json"]
+```
+
+Default colour sequence is red → green → blue → white/extra-channel → an
+ascending R/G/B/W pattern → off — one channel isolated at a time, so a wiring
+or colour-order mistake shows up as "red channel is empty" instead of a wall
+of ambiguous bytes.
+
+Same session, shown as who-does-what over time — three actors, not two: you,
+the host tool, and the ESP32 itself:
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Tool as host_record.py
+    participant ESP as ESP32-S3
+
+    You->>Tool: run with -p /dev/cu.usbserial-...
+    Tool->>You: numbered IC list
+    You->>Tool: pick IC (e.g. "6) TM1814")
+    Tool->>ESP: sends '1' or '2' (mode select)
+    Tool->>You: "LED / pixel count?"
+    You->>Tool: e.g. 50
+    Tool->>You: "notes? (optional)"
+    You->>Tool: Enter (skip) or a note
+    Tool->>You: expected bytes/frame printed
+
+    loop each colour (red, green, blue, white, ascending, off)
+        Tool->>You: "Set string to RED, press Enter"
+        You->>ESP: (sets R=255,G=0,B=0 on the BBB)
+        You->>Tool: Enter (starts capture)
+        ESP-->>Tool: frame reports stream over serial
+        Tool->>You: live verdict per frame
+        You->>Tool: Enter (stops capture)
+        Tool->>You: "[Enter]=next / r / s / a / q ?"
+        You->>Tool: choice
+    end
+
+    Tool->>You: session summary (pass/fail per colour)
+    Tool->>Tool: writes .log + .json to captures/
+```
+
 1. **Pick the IC** from a numbered list (mirrors `protocols.h`'s timing
    profiles and `spi_decoders.h`'s SPI chips — see `ic_catalog.py`) or type
    a custom name. This also auto-sends `1`/`2` to the device to select the
@@ -184,8 +287,8 @@ compromised.
 
 **Where captures live:** `captures/` in this directory, tracked in this
 folder's own git repo so a capture's history is versioned alongside the
-exact tool code that produced it — and backed up to a **private** GitHub
-repo, [joeskolengaden/esp32-led-analyzer](https://github.com/joeskolengaden/esp32-led-analyzer).
+exact tool code that produced it — and backed up to
+[joeskolengaden/esp32-led-analyzer](https://github.com/joeskolengaden/esp32-led-analyzer) on GitHub.
 Nothing leaves this machine automatically; recording writes local files
 only. When you have a batch of sessions worth keeping:
 ```bash
