@@ -168,14 +168,30 @@ guided, interactive session**, not passive recording:
 It prompts you through the whole test, and stores exactly what you tell it
 alongside every frame it captures — so a recording answers "what IC, how
 many LEDs, what colour" on its own later, instead of you having to remember
-or reverse-engineer it from a raw byte dump:
+or reverse-engineer it from a raw byte dump.
+
+**Before it even asks, it listens.** By default the very first thing that
+happens is a short auto-detect sniff: the tool tries single-wire mode, then
+SPI mode, and if a real frame shows up in either it runs the same
+timing/signature/byte-count logic the pass/fail checks already use — just
+run *backwards*, from "what did we see" to "what IC and LED count would
+produce that" — and suggests a ranked guess instead of an empty prompt. You
+still confirm or correct it; nothing is ever auto-accepted. See
+"Auto-detect" below for exactly how the guess is scored and what it looks
+like when it's wrong or ambiguous.
 
 ```mermaid
 flowchart TD
-    Start(["run host_record.py"]) --> PickIC["Pick IC from numbered list\n(or type a custom name)"]
+    Start(["run host_record.py"]) --> Detect{"auto-detect:\nlisten in single-wire mode,\nthen SPI mode\n(a few seconds each)"}
+    Detect -->|signal found| Suggest["show ranked IC + LED-count\nguesses from the timing/\nsignature/byte-count evidence"]
+    Suggest --> Confirm{"you: accept / pick\na different guess / m=manual"}
+    Confirm -->|accept or pick| ConfirmLED["confirm / adjust the\nguessed LED count"]
+    ConfirmLED --> Notes
+    Confirm -->|m, or nothing found| PickIC["Pick IC from numbered list\n(or type a custom name)"]
+    Detect -->|nothing in either mode| PickIC
     PickIC --> AutoMode["tool auto-sends '1' or '2'\nto select capture mode"]
-    AutoMode --> LEDCount["Enter LED / pixel count"]
-    LEDCount --> Notes["Enter session notes\n(optional)"]
+    AutoMode --> EnterLED["Enter LED / pixel count"]
+    EnterLED --> Notes["Enter session notes\n(optional)"]
     Notes --> ExpBytes["tool prints expected\nbytes/frame"]
     ExpBytes --> Loop
 
@@ -213,11 +229,26 @@ sequenceDiagram
     participant ESP as ESP32-S3
 
     You->>Tool: run with -p /dev/cu.usbserial-...
-    Tool->>You: numbered IC list
-    You->>Tool: pick IC (e.g. "6) TM1814")
-    Tool->>ESP: sends '1' or '2' (mode select)
-    Tool->>You: "LED / pixel count?"
-    You->>Tool: e.g. 50
+    Tool->>ESP: sends '1' (try single-wire mode)
+    alt signal seen within a few seconds
+        ESP-->>Tool: frame report
+        Tool->>You: "Detected TM1814, ~50 LEDs -- use it? [Y]/pick/m"
+        You->>Tool: Enter (accept)
+    else nothing in single-wire mode
+        Tool->>ESP: any key, then '2' (try SPI mode)
+        alt signal seen
+            ESP-->>Tool: frame report
+            Tool->>You: ranked guesses, same as above
+            You->>Tool: accept, pick a different one, or 'm'
+        else nothing in either mode
+            Tool->>You: "No signal detected -- falling back to manual"
+            Tool->>You: numbered IC list
+            You->>Tool: pick IC (e.g. "6) TM1814")
+            Tool->>ESP: sends '1' or '2' (mode select)
+        end
+    end
+    Tool->>You: "LED / pixel count?" (pre-filled with the guess, if any)
+    You->>Tool: confirm or type a different number
     Tool->>You: "notes? (optional)"
     You->>Tool: Enter (skip) or a note
     Tool->>You: expected bytes/frame printed
@@ -237,31 +268,22 @@ sequenceDiagram
     Tool->>Tool: writes .log + .json to captures/
 ```
 
-**What it actually looks like on screen** — a real (abbreviated) transcript, exactly as printed, for a 50-pixel TM1814 string. `-->` marks where you type something and press Enter; everything else is what the tool prints:
+**What it actually looks like on screen** — a real (abbreviated) transcript, exactly as printed, for a 50-pixel TM1814 string that was already plugged in and driving a test pattern when the tool started. `-->` marks where you type something and press Enter; everything else is what the tool prints:
 
 ```
 === Guided capture session ===
 
-Known ICs:
-   1) WS2812/WS2811/SK6812 (Normal)  (single-wire)
-   2) APA104/APA106/PL9823/SK6822  (single-wire)
-   3) WS2811 400Kbps  (single-wire)
-   4) UCS1903/UCS2903 400Kbps  (single-wire)
-   5) TM1803  (single-wire)
-   6) TM1814  (single-wire)
-   7) TM1829  (single-wire)
-   8) WS2805  (single-wire)
-   9) TM1914  (single-wire)
-  10) UCS7604 (8-bit)  (single-wire)
-       ... (SPI chips further down the same list) ...
-  19) other (type a custom name)
-Pick an IC [1-19]: --> 6
+Listening for a signal (3s per mode, single-wire then SPI)...
 
-LED / pixel count in the test string [1]: --> 50
+Detected a signal in single-wire mode.
+  Best guesses (ranked -- confirm before recording, this is not certain):
+    1) TM1814, ~50 LEDs
+    2) UCS8904 (16-bit RGBW), ~26 LEDs
+  [Enter]=use #1, or a number, or m=manual picklist: --> [Enter]
+LED / pixel count in the test string [50]: --> [Enter]
 Session notes (optional, Enter to skip): --> bench test, TM1814 string #2
 
-Opening /dev/cu.usbserial-0001 @ 115200 baud...
-Selecting single-wire mode on the device (sending '1')...
+Already listening in single-wire mode from auto-detect -- continuing without re-selecting.
 Expecting 208 bytes/frame for 50x TM1814 (8 preamble + 4*50 pixel + 0 trailer).
 
 ==> Set the TM1814 string to RED (R=255,G=0,B=0,W=0) on the BBB, then press Enter to start capturing.
@@ -315,12 +337,17 @@ capture, so here's what each field means and what a real failure looks like:
                                         ^^^^^^^^         ^^^^^ both point at the same root cause
 ```
 
-1. **Pick the IC** from a numbered list (mirrors `protocols.h`'s timing
-   profiles and `spi_decoders.h`'s SPI chips — see `ic_catalog.py`) or type
-   a custom name. This also auto-sends `1`/`2` to the device to select the
-   right capture mode — one less manual step.
-2. **Enter the LED/pixel count** in your test string. Combined with the IC's
-   known preamble/trailer/bytes-per-pixel, the script computes the *expected*
+0. **Auto-detect** (default, on by default): the tool listens for a real
+   signal before asking you anything. See "Auto-detect: how the guess is
+   made" below for exactly what it does and doesn't know.
+1. **Pick the IC** — if auto-detect found nothing, you declined its guess
+   (`m`), or you ran with `--no-detect`: a numbered list (mirrors
+   `protocols.h`'s timing profiles and `spi_decoders.h`'s SPI chips — see
+   `ic_catalog.py`) or type a custom name. This also auto-sends `1`/`2` to
+   the device to select the right capture mode — one less manual step.
+2. **Enter/confirm the LED-pixel count** in your test string (pre-filled
+   with auto-detect's guess when it has one). Combined with the IC's known
+   preamble/trailer/bytes-per-pixel, the script computes the *expected*
    byte count up front and checks every captured frame against it.
 3. **Cycle through colours**, one at a time: it tells you what to set on the
    BBB (`R=255,G=0,B=0` etc.), waits for Enter once you've set it, then
@@ -339,6 +366,30 @@ capture, so here's what each field means and what a real failure looks like:
    per-line-timestamped format as before) *and* `.json` (structured: IC name,
    LED count, notes, and every segment's intended colour + parsed frames —
    see `frame_parser.py` for exactly what gets extracted from each report).
+
+**Auto-detect: how the guess is made, and its real limits.** It tries
+single-wire mode first, listens for a few seconds (`--detect-seconds`,
+default 3), and if nothing shows up switches to SPI mode and tries again.
+Once a real frame arrives, `ic_catalog.py`'s `guess_ics()` scores every
+catalog entry against it:
+- **Single-wire:** a preamble/trailer signature match is strong evidence
+  (TM1814/TM1914/UCS7604/SM16825E carry one); a timing-profile match alone
+  is weaker, since some families genuinely overlap — TM1814 and TM1914
+  share identical wire timing (only their preamble differs), and TM1829's
+  window overlaps both (see `test_native/test_protocols.cpp`'s documented
+  finding); and the byte count either divides evenly into that IC's
+  preamble+trailer+bpp shape or it doesn't, which is enough to rule out
+  most wrong guesses even when timing alone can't.
+- **SPI:** the firmware already runs *every* known chip's framing check
+  against *every* capture (that's the whole design — see `spi_decoders.h`),
+  so detection just reads which block came back cleanest and pulls the LED
+  count straight out of its own "pixel frames found" line — no separate
+  arithmetic needed.
+- **It can be wrong.** A floating/unwired pin can still produce a "frame"
+  out of electrical noise, and closely-related chips can legitimately tie.
+  That's why it's always a ranked list you confirm, pick from, or reject
+  (`m` for the manual picklist) — never an auto-accept. Skip the sniff
+  entirely with `--no-detect` if you'd rather always pick by hand.
 
 **Retrieving recordings later** — `list_captures.py` reads the `.json`
 sidecars, no need to open files by hand:

@@ -17,6 +17,7 @@ bytes added once per port, not per pixel (see fpp-bbb-pixels' decoration-byte
 mechanism). `bit_based=True` means the chip isn't byte-granular (SM16716) --
 byte-count sanity-checking is skipped for those, since the real check is bits.
 """
+import re
 
 # ============================================================================
 # Mode codes -- same characters the firmware's serial menu expects (send '1'
@@ -124,3 +125,88 @@ def expected_byte_count(ic, led_count):
 
 def catalog_names():
     return list(IC_CATALOG.keys())
+
+
+# ============================================================================
+# Auto-detect scoring: given one already-parsed frame (see frame_parser.py),
+# guess which catalog IC it's most likely from and how many LEDs it implies
+# -- a ranked, best-effort suggestion for host_record.py's auto-detect
+# pre-flight, never a certainty. Evidence used:
+#   single-wire: timing-profile match (weak), preamble/trailer signature
+#                match (strong), and whether the byte count divides evenly
+#                into whole pixels for that IC's bpp (arithmetic sanity).
+#   SPI:         the firmware already runs EVERY known SPI chip's framing
+#                check against every capture (see spi_decoders.h), so this
+#                just reads which block reported the most "OK"s and pulls
+#                the LED count straight out of its own "pixel frames found"
+#                line -- no guessing of our own beyond picking the block.
+# A floating/unconnected pin can still produce a "frame" (noise interpreted
+# as edges), so a nonempty result here is a suggestion to confirm, not proof
+# a real IC is actually connected.
+# ============================================================================
+
+def _spi_pixel_count_guess(info):
+    """Pulls the leading integer off a spi_checks sub-block's "pixel frames
+    found" value (e.g. "2 (each [...])" -> 2). None if that key is absent
+    (WS2801's block has no such line -- see below) or unparseable."""
+    val = info.get("pixel frames found")
+    if not val:
+        return None
+    m = re.match(r"\s*(\d+)", val)
+    return int(m.group(1)) if m else None
+
+
+def guess_ics(frame):
+    """Returns a list of (name, ic_entry, score, led_count_guess) tuples,
+    highest score first, for the given parsed frame dict. Empty list means
+    "no real evidence" -- caller should fall back to manual selection."""
+    candidates = []
+    if frame["frame_type"] == "single-wire":
+        for name, ic in IC_CATALOG.items():
+            if ic["mode"] != SINGLE_WIRE:
+                continue
+            score = 0
+            led_guess = None
+            want_timing = ic.get("timing")
+            if want_timing and any(want_timing in m for m in frame["timing_matches"]):
+                score += 1
+            want_sig = ic.get("signature")
+            if want_sig and any(want_sig in s["name"] for s in frame["signature_matches"]):
+                score += 3  # a signature match is much stronger evidence than timing alone
+            bpp, pre, tr, bc = ic.get("bpp"), ic.get("preamble"), ic.get("trailer"), frame.get("byte_count")
+            if bpp and pre is not None and tr is not None and bc is not None:
+                rem = bc - pre - tr
+                if rem > 0 and rem % bpp == 0:
+                    led_guess = rem // bpp
+                    score += 1
+                else:
+                    score -= 2  # byte count doesn't fit this IC's shape at all
+            if score > 0:
+                candidates.append((name, ic, score, led_guess))
+    else:  # SPI -- the firmware already ran every chip's check on this frame
+        for name, ic in IC_CATALOG.items():
+            if ic["mode"] != SPI:
+                continue
+            score = 0
+            led_guess = None
+            block = ic.get("spi_block")
+            info = frame.get("spi_checks", {}).get(block, {}) if block else {}
+            if name.startswith("WS2801"):
+                # WS2801 is a raw passthrough with no framing markers, so its
+                # only signal is "byte count divides evenly into RGB triples."
+                bc = frame.get("byte_count")
+                if bc and bc > 0 and bc % 3 == 0:
+                    score += 2
+                    led_guess = bc // 3
+                else:
+                    score -= 2
+            else:
+                score += sum(1 for v in info.values() if "OK" in v)
+                px = _spi_pixel_count_guess(info)
+                if px:
+                    score += 2
+                    led_guess = px
+            if score > 0:
+                candidates.append((name, ic, score, led_guess))
+    candidates.sort(key=lambda c: c[2], reverse=True)
+    return candidates

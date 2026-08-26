@@ -35,7 +35,7 @@ except ImportError:
         "then re-run with .venv/bin/python3 host_record.py ..."
     )
 
-from ic_catalog import IC_CATALOG, SINGLE_WIRE, SPI, DEFAULT_COLOUR_SEQUENCE, expected_byte_count, catalog_names
+from ic_catalog import IC_CATALOG, SINGLE_WIRE, SPI, DEFAULT_COLOUR_SEQUENCE, expected_byte_count, catalog_names, guess_ics
 from frame_parser import FrameAccumulator
 
 DEFAULT_BAUD = 115200
@@ -113,6 +113,101 @@ def prompt_ic_selection():
 
 
 # ============================================================================
+# Auto-detect pre-flight: before asking the user to pick an IC and enter an
+# LED count by hand, briefly listen on the wire and try to guess both from
+# what's actually there. This is a suggestion to confirm, not a verdict --
+# a floating/unwired pin can still produce a "frame" out of noise, and
+# timing/signature matches are inherently ambiguous for some chip families
+# (see protocols.h's TM1814/TM1829/TM1914 overlap). The user always gets the
+# final say, exactly like every other pass/fail check in this tool.
+# ============================================================================
+
+def _listen_for_frame(ser, acc, seconds):
+    """Reads from `ser` for up to `seconds`, feeding each line to `acc`.
+    Returns the first complete frame dict, or None if nothing completed
+    within the time budget."""
+    deadline = time.time() + seconds
+    buf = b""
+    while time.time() < deadline:
+        chunk = ser.read(256)
+        if not chunk:
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = _ANSI_RE.sub(b"", line).rstrip(b"\r")
+            frame = acc.feed(line.decode("utf-8", errors="replace"))
+            if frame is not None:
+                return frame
+    return None
+
+
+def auto_detect(port_name, baud, seconds_per_mode=3.0):
+    """Tries single-wire mode first, then SPI mode, waiting up to
+    `seconds_per_mode` in each for a real frame to arrive. Returns
+    (ser, mode_str, frame) and leaves `ser` OPEN if something was found --
+    the caller should hand that same connection to guided_session() rather
+    than reopening (reopening risks a board reset undoing the mode we just
+    selected, depending on the board's auto-reset wiring). Returns
+    (None, None, None), with the port already closed, if nothing arrived in
+    either mode -- e.g. nothing is wired up yet."""
+    print(f"\nListening for a signal ({seconds_per_mode:.0f}s per mode, single-wire then SPI)...")
+    try:
+        ser = serial.Serial(port_name, baud, timeout=0.2)
+    except serial.SerialException as e:
+        print(f"  Couldn't open {port_name} for auto-detect: {e}")
+        return None, None, None
+
+    time.sleep(0.3)  # let the board finish printing its boot banner/menu
+    ser.reset_input_buffer()
+    ser.write(SINGLE_WIRE.encode())
+    frame = _listen_for_frame(ser, FrameAccumulator(), seconds_per_mode)
+    if frame is not None:
+        return ser, "single-wire", frame
+
+    ser.write(b" ")  # any key while capturing returns the device to its menu
+    time.sleep(0.1)
+    ser.reset_input_buffer()
+    ser.write(SPI.encode())
+    frame = _listen_for_frame(ser, FrameAccumulator(), seconds_per_mode)
+    if frame is not None:
+        return ser, "SPI", frame
+
+    ser.close()
+    return None, None, None
+
+
+def prompt_confirm_detection(mode_str, frame):
+    """Shows guess_ics()'s ranked candidates for a detected frame and lets
+    the user accept the top guess, pick a different one, adjust the LED
+    count, or bail to the manual picklist. Returns (ic_name, ic, led_count)
+    on acceptance, or None to signal "fall back to manual"."""
+    candidates = guess_ics(frame)
+    print(f"\nDetected a signal in {mode_str} mode.")
+    if not candidates:
+        print("  Couldn't confidently match it to a known IC from timing/signature alone.")
+        return None
+    shown = candidates[:5]
+    print("  Best guesses (ranked -- confirm before recording, this is not certain):")
+    for i, (name, ic, score, led_guess) in enumerate(shown, 1):
+        led_txt = f", ~{led_guess} LEDs" if led_guess else ""
+        print(f"    {i}) {name}{led_txt}")
+    choice = input("  [Enter]=use #1, or a number, or m=manual picklist: ").strip().lower()
+    if choice == "m":
+        return None
+    if choice == "":
+        idx = 0
+    elif choice.isdigit() and 1 <= int(choice) <= len(shown):
+        idx = int(choice) - 1
+    else:
+        print("  Not a valid choice -- falling back to the manual picklist.")
+        return None
+    name, ic, _, led_guess = shown[idx]
+    led_count = _ask_int("LED / pixel count in the test string", led_guess or 1)
+    return name, ic, led_count
+
+
+# ============================================================================
 # Per-frame pass/fail verdict, computed against the selected IC's expectations
 # ============================================================================
 
@@ -176,7 +271,7 @@ class SessionState:
 # queryable session data) no matter how the session ends -- including Ctrl+C.
 # ============================================================================
 
-def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes):
+def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes, ser=None, mode_confirmed=False):
     import json
 
     # ---- Setup: filenames, serial port, log header, mode select ----
@@ -187,13 +282,17 @@ def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes):
     logpath = out_dir / f"session_{session_id}.log"
     jsonpath = out_dir / f"session_{session_id}.json"
 
-    print(f"\nOpening {port_name} @ {baud} baud...")
-    try:
-        ser = serial.Serial(port_name, baud, timeout=0.2)
-    except serial.SerialException as e:
-        sys.exit(f"Couldn't open {port_name}: {e}\n"
-                  f"Check the device is plugged in, the path is right (--list to see options), "
-                  f"and no other program (Arduino Serial Monitor, another host_record.py) has it open.")
+    # `ser` may already be open and in the right mode, handed off from
+    # auto_detect()'s pre-flight sniff -- reopening here instead would risk
+    # a board reset undoing the mode select we already confirmed.
+    if ser is None:
+        print(f"\nOpening {port_name} @ {baud} baud...")
+        try:
+            ser = serial.Serial(port_name, baud, timeout=0.2)
+        except serial.SerialException as e:
+            sys.exit(f"Couldn't open {port_name}: {e}\n"
+                      f"Check the device is plugged in, the path is right (--list to see options), "
+                      f"and no other program (Arduino Serial Monitor, another host_record.py) has it open.")
     start = datetime.datetime.now()
     log = open(logpath, "w", encoding="utf-8", errors="replace")
     log.write(f"# ESP32 LED Signal Analyzer -- guided session\n# ic: {ic_name}\n"
@@ -203,8 +302,11 @@ def guided_session(port_name, baud, out_dir, ic_name, ic, led_count, notes):
 
     mode_name = "single-wire" if ic["mode"] == SINGLE_WIRE else "SPI"
     exp_bytes = expected_byte_count(ic, led_count)
-    print(f"Selecting {mode_name} mode on the device (sending '{ic['mode']}')...")
-    ser.write(ic["mode"].encode())
+    if mode_confirmed:
+        print(f"Already listening in {mode_name} mode from auto-detect -- continuing without re-selecting.")
+    else:
+        print(f"Selecting {mode_name} mode on the device (sending '{ic['mode']}')...")
+        ser.write(ic["mode"].encode())
     if ic["mode"] == SPI:
         print("Reminder: temporarily lower spiSpeed to ~200000 in your FPP config for this test.")
     if exp_bytes is not None:
@@ -469,6 +571,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="list available serial ports and exit")
     ap.add_argument("--freeform", action="store_true", help="old passive mode: no prompts, just record everything")
     ap.add_argument("-l", "--label", help="(--freeform only) short label appended to the filename")
+    ap.add_argument("--no-detect", action="store_true",
+                     help="skip the auto-detect sniff, go straight to the manual IC/LED-count prompts")
+    ap.add_argument("--detect-seconds", type=float, default=3.0,
+                     help="how long to listen per mode during auto-detect (default 3s)")
     args = ap.parse_args()
 
     if args.list:
@@ -483,10 +589,36 @@ def main():
         return
 
     print("=== Guided capture session ===")
-    ic_name, ic = prompt_ic_selection()
-    led_count = _ask_int("LED / pixel count in the test string", 1)
+
+    ser = None
+    ic_name = ic = led_count = None
+    mode_confirmed = False
+    try:
+        if not args.no_detect:
+            ser, mode_str, frame = auto_detect(args.port, args.baud, args.detect_seconds)
+            if frame is not None:
+                result = prompt_confirm_detection(mode_str, frame)
+                if result is not None:
+                    ic_name, ic, led_count = result
+                    mode_confirmed = True
+                else:
+                    ser.close()  # declined the guess -- let guided_session open a fresh connection
+                    ser = None
+            else:
+                print("  No signal detected in either mode -- check wiring, or the string "
+                      "isn't being driven yet. Falling back to manual selection.")
+    except KeyboardInterrupt:
+        if ser is not None:
+            ser.close()
+        sys.exit("\nCancelled before any capture started -- nothing was recorded.")
+
+    if ic is None:
+        ic_name, ic = prompt_ic_selection()
+        led_count = _ask_int("LED / pixel count in the test string", 1)
+
     notes = input("Session notes (optional, Enter to skip): ").strip()
-    guided_session(args.port, args.baud, Path(args.out_dir), ic_name, ic, led_count, notes)
+    guided_session(args.port, args.baud, Path(args.out_dir), ic_name, ic, led_count, notes,
+                   ser=ser, mode_confirmed=mode_confirmed)
 
 
 if __name__ == "__main__":
