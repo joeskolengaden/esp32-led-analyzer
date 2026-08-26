@@ -151,6 +151,7 @@ a `HardwareSerial` stub plus two suites feeding known values through the
 cd test_native
 c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I.. test_protocols.cpp -o /tmp/tp && /tmp/tp
 c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I.. test_spi_decoders.cpp -o /tmp/ts && /tmp/ts
+c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I. -I.. test_wifi_setup.cpp -o /tmp/tw && /tmp/tw
 ```
 
 - `test_protocols.cpp`: every timing profile matches its own reference
@@ -173,9 +174,30 @@ c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I.. test_spi_decoders
   top-3-bits pattern) and was greedily consuming the end frame as an extra
   "pixel" — fixed by backtracking off a trailing all-`0xFF` run only when
   the walk consumed every remaining byte.
-- Neither suite proves the RMT/GPIO *capture* itself is correct on real
-  hardware — only that the analysis logic downstream of a capture is. That
-  still needs a real ESP32 and a real signal.
+- `test_wifi_setup.cpp`: `wifi_setup.h` includes the real `<WiFi.h>` /
+  `<Preferences.h>`, which don't exist off an ESP32 — `test_native/WiFi.h`,
+  `Preferences.h`, and `wifi_stubs.h` provide native stand-ins (fake
+  `String`/`Preferences`/`WiFi`/`Serial`, a simulated clock instead of real
+  wall-clock delays) that only resolve when compiling *from this directory*
+  with `-I.` ahead of the real core's path; arduino-cli's actual firmware
+  build never sees `test_native/`, confirmed by an identical compiled size
+  before/after these files existed. 31 tests cover the saved-network slot
+  logic (append, update-in-place on a re-saved SSID, oldest-evicted once
+  the 5-network cap is hit), line parsing, and the full interactive menu
+  (pick a saved network, scan-then-pick, forget-all, a failed connect never
+  gets saved, invalid/out-of-range input). Also caught a real bug this way:
+  `wifi_read_line()` swallowed a bare Enter press instead of returning
+  immediately, meaning every `[Y/n], Enter = default` prompt would sit
+  unresponsive for the *full* 10-30s timeout on real hardware before the
+  default kicked in — fixed so `\r` is dropped and `\n` always ends the
+  line right away, empty or not. What this suite can't verify: real
+  `WiFi.scanNetworks()`/`WiFi.begin()` behavior or real NVS flash
+  persistence — both `MockWiFi`'s results and its connect outcome are
+  test-controlled fakes, not a real radio.
+- None of these suites prove the RMT/GPIO *capture*, or the WiFi join
+  itself, is correct on real hardware — only that the logic downstream of
+  each is. That still needs a real ESP32, a real signal, and a real
+  network.
 
 ## Build & flash
 **Arduino IDE:** install the *esp32* boards package (Boards Manager, core

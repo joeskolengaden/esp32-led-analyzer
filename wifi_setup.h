@@ -103,17 +103,23 @@ static void wifi_forget_all() {
 // ============================================================================
 
 static String wifi_read_line(uint32_t timeoutMs) {
+    // \r is dropped everywhere it appears (handles a \r\n pair transparently,
+    // whichever order it arrives in relative to real content); \n always
+    // ends the line immediately -- INCLUDING when the line is still empty,
+    // which is what makes a bare Enter press register as "submit nothing"
+    // right away instead of silently waiting out the full timeout. (An
+    // earlier version swallowed any leading \r/\n unconditionally, meaning
+    // every "[Y/n], Enter = default" prompt in this file effectively didn't
+    // respond to Enter until the whole timeout elapsed -- fixed here.)
     String line = "";
     uint32_t deadline = millis() + timeoutMs;
     while ((int32_t)(deadline - millis()) > 0) {
         if (Serial.available()) {
             char c = Serial.read();
-            if (c == '\n' || c == '\r') {
-                if (line.length() > 0) return line;
-                continue;  // swallow a lone \r or \n before real input starts
-            }
+            deadline = millis() + timeoutMs;  // any byte arriving resets the timeout
+            if (c == '\r') continue;
+            if (c == '\n') return line;
             line += c;
-            deadline = millis() + timeoutMs;
         }
     }
     return line;  // possibly empty, on timeout
