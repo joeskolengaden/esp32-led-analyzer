@@ -237,6 +237,84 @@ sequenceDiagram
     Tool->>Tool: writes .log + .json to captures/
 ```
 
+**What it actually looks like on screen** — a real (abbreviated) transcript, exactly as printed, for a 50-pixel TM1814 string. `-->` marks where you type something and press Enter; everything else is what the tool prints:
+
+```
+=== Guided capture session ===
+
+Known ICs:
+   1) WS2812/WS2811/SK6812 (Normal)  (single-wire)
+   2) APA104/APA106/PL9823/SK6822  (single-wire)
+   3) WS2811 400Kbps  (single-wire)
+   4) UCS1903/UCS2903 400Kbps  (single-wire)
+   5) TM1803  (single-wire)
+   6) TM1814  (single-wire)
+   7) TM1829  (single-wire)
+   8) WS2805  (single-wire)
+   9) TM1914  (single-wire)
+  10) UCS7604 (8-bit)  (single-wire)
+       ... (SPI chips further down the same list) ...
+  19) other (type a custom name)
+Pick an IC [1-19]: --> 6
+
+LED / pixel count in the test string [1]: --> 50
+Session notes (optional, Enter to skip): --> bench test, TM1814 string #2
+
+Opening /dev/cu.usbserial-0001 @ 115200 baud...
+Selecting single-wire mode on the device (sending '1')...
+Expecting 208 bytes/frame for 50x TM1814 (8 preamble + 4*50 pixel + 0 trailer).
+
+==> Set the TM1814 string to RED (R=255,G=0,B=0,W=0) on the BBB, then press Enter to start capturing.
+--> [Enter]
+  Capturing 'red'... press Enter again once you've seen enough frames.
+    frame: bytes 208/208 OK | timing OK | polarity OK | signature OK
+    frame: bytes 208/208 OK | timing OK | polarity OK | signature OK
+--> [Enter]
+  -> 2 frame(s) captured, 2/2 matched expectations.
+  [Enter]=next colour, r=repeat this colour, s=skip remaining defaults, a=add a custom colour, q=end session: --> [Enter]
+
+==> Set the TM1814 string to GREEN (R=0,G=255,B=0,W=0) on the BBB, then press Enter to start capturing.
+--> [Enter]
+  Capturing 'green'... press Enter again once you've seen enough frames.
+    frame: bytes 208/208 OK | timing OK | polarity OK | signature OK
+--> [Enter]
+  -> 1 frame(s) captured, 1/1 matched expectations.
+  [Enter]=next colour, r=repeat this colour, s=skip remaining defaults, a=add a custom colour, q=end session: --> [Enter]
+
+       ... (blue, white/extra-channel, ascending, off — same pattern) ...
+
+============================================================
+Session summary: TM1814  (50 LEDs, single-wire)
+  red                    2/2 frames  OK
+  green                  1/1 frames  OK
+  blue                   1/1 frames  OK
+  white/extra-channel    1/1 frames  OK
+  ascending              1/1 frames  OK
+  off                    1/1 frames  OK
+Saved: captures/session_20260826_141502_TM1814.log
+        captures/session_20260826_141502_TM1814.json
+```
+
+**Reading a live verdict line** — this is the part you're actually watching during
+capture, so here's what each field means and what a real failure looks like:
+
+```
+    frame: bytes 208/208 OK | timing OK | polarity OK | signature OK
+            └──┬──┘          └───┬───┘   └────┬────┘   └─────┬─────┘
+         got vs. expected     matched      idle-HIGH/     preamble/trailer
+         byte count for       protocols.h's LOW polarity   byte pattern
+         this IC+LED count    timing window matched what   found where
+                               (per protocols.h)  the IC expects  expected
+
+  Example FAIL — wrong LED count entered, or a wiring/colour-order bug:
+    frame: bytes 158/208 MISMATCH | timing OK | polarity OK | signature OK
+                          ^^^^^^^^ fewer bytes arrived than the IC+LED count predicts
+
+  Example FAIL — inverted chip wired/decoded as non-inverted (or vice versa):
+    frame: bytes 208/208 OK | timing NO MATCH | polarity WRONG | signature OK
+                                        ^^^^^^^^         ^^^^^ both point at the same root cause
+```
+
 1. **Pick the IC** from a numbered list (mirrors `protocols.h`'s timing
    profiles and `spi_decoders.h`'s SPI chips — see `ic_catalog.py`) or type
    a custom name. This also auto-sends `1`/`2` to the device to select the
