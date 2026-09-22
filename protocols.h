@@ -106,7 +106,16 @@ static inline bool inRange(int v, int lo, int hi) { return v >= lo && v <= hi; }
 // Classifies a capture against every timing profile; prints every match
 // (several may match -- that's expected, e.g. Normal/UCS7604/UCS8903 share
 // timing) plus near-misses within 20% to help spot a marginal signal.
-static void classify_timing(bool inverted, int t0Ns, int t1Ns, int periodNs, HardwareSerial& out) {
+//
+// `out` is templated, not HardwareSerial&, because the ESP32-S3's `Serial`
+// is a DIFFERENT class depending on board config -- plain HardwareSerial
+// (UART0), HWCDC (USB CDC On Boot enabled, this board's config), or USBCDC
+// (USB-OTG/TinyUSB mode). All three support .printf()/.println(), which is
+// all this ever calls, so a template compiles against whichever one is
+// actually in play -- including the native test harness's own unrelated
+// HardwareSerial stub, with no inheritance relationship required at all.
+template <typename Out>
+static void classify_timing(bool inverted, int t0Ns, int t1Ns, int periodNs, Out& out) {
     bool anyMatch = false;
     for (int i = 0; i < NUM_TIMING_PROFILES; i++) {
         const TimingProfile& p = TIMING_PROFILES[i];
@@ -135,7 +144,8 @@ static void classify_timing(bool inverted, int t0Ns, int t1Ns, int periodNs, Har
 }
 
 // Scans a decoded byte buffer for known preamble/trailer signatures.
-static void match_signatures(const uint8_t* bytes, int nBytes, HardwareSerial& out) {
+template <typename Out>
+static void match_signatures(const uint8_t* bytes, int nBytes, Out& out) {
     bool any = false;
     for (int i = 0; i < NUM_SIGNATURES; i++) {
         const Signature& s = SIGNATURES[i];

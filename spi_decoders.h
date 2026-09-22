@@ -13,7 +13,13 @@ static inline int spi_getBit(const uint8_t* buf, uint32_t bitIdx) {
 }
 
 // Byte-oriented checks (APA102/WS2801/P9813 are all byte-aligned).
-static void spi_check_apa102(const uint8_t* b, int n, const char* label, HardwareSerial& out) {
+//
+// `out` is templated, not HardwareSerial&, because ESP32-S3's `Serial` is a
+// different class depending on board config (plain HardwareSerial / HWCDC /
+// USBCDC) -- all four functions below only ever call .printf()/.println(),
+// so a template compiles against whichever one is actually in play.
+template <typename Out>
+static void spi_check_apa102(const uint8_t* b, int n, const char* label, Out& out) {
     out.printf("  -- %s framing check --\n", label);
     if (n < 4 + 4) { out.println("     too short to be a valid frame"); return; }
     bool sofOk = true;
@@ -52,7 +58,8 @@ static void spi_check_apa102(const uint8_t* b, int n, const char* label, Hardwar
     }
 }
 
-static void spi_check_p9813(const uint8_t* b, int n, HardwareSerial& out) {
+template <typename Out>
+static void spi_check_p9813(const uint8_t* b, int n, Out& out) {
     out.println("  -- P9813 framing check --");
     if (n < 4 + 4) { out.println("     too short to be a valid frame"); return; }
     bool sofOk = true;
@@ -68,7 +75,8 @@ static void spi_check_p9813(const uint8_t* b, int n, HardwareSerial& out) {
     if (px > 0) out.printf("     first pixel: flag=0x%02X, BGR=%02X %02X %02X\n", b[4], b[5], b[6], b[7]);
 }
 
-static void spi_check_ws2801(const uint8_t* b, int n, HardwareSerial& out) {
+template <typename Out>
+static void spi_check_ws2801(const uint8_t* b, int n, Out& out) {
     out.println("  -- WS2801 framing check --");
     out.printf("     %d bytes captured, %s\n", n,
                (n % 3 == 0 && n > 0) ? "divisible by 3 (RGB triples) OK" : "NOT divisible by 3 -- check byte count");
@@ -77,7 +85,8 @@ static void spi_check_ws2801(const uint8_t* b, int n, HardwareSerial& out) {
 
 // SM16716/SM16726: bit-level, not byte-aligned. 50 zero start bits, then per
 // pixel: 1 marker bit ('1') + 24-bit RGB MSB-first. See SPIChipFormat.h.
-static void spi_check_sm16716(const uint8_t* b, uint32_t nBits, HardwareSerial& out) {
+template <typename Out>
+static void spi_check_sm16716(const uint8_t* b, uint32_t nBits, Out& out) {
     out.println("  -- SM16716/SM16726 framing check --");
     if (nBits < 50) { out.println("     too short to be a valid frame"); return; }
     uint32_t zeros = 0;
