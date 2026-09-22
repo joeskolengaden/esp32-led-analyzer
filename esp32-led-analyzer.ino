@@ -37,19 +37,30 @@
 enum Mode { MODE_MENU, MODE_SINGLEWIRE, MODE_SPI };
 static Mode mode = MODE_MENU;
 
+static const char* MENU_RULE = "========================================================================";
+
 static void print_menu() {
-    Serial.println("\n=== ESP32-S3 LED Signal Analyzer ===");
+    Serial.println();
+    Serial.println(MENU_RULE);
+    Serial.println("  ESP32-S3 LED Signal Analyzer");
+    Serial.println(MENU_RULE);
     Serial.println("!! GPIO is 3.3V ONLY -- a bare 5V data/clock line WILL damage this board.");
     Serial.println("!! No level-shifter chip needed: a 1k resistor (source->pin) + a 2k resistor");
     Serial.println("!! (pin->GND) does the same job for a few cents. Don't feed 5V in unshifted.");
-    Serial.println("  1) Single-wire capture (WS281x family, TM1814/1829/1914, UCS7604, WS2805, SM16825E...)");
-    Serial.println("  2) SPI capture (APA102/SK9822/HD107S, WS2801, P9813, SM16716/SM16726)");
+    Serial.println();
+    Serial.println("Capture modes:");
+    Serial.println("  1) Single-wire  (WS281x family, TM1814/1829/1914, UCS7604, WS2805, SM16825E...)");
+    Serial.println("  2) SPI/clocked  (APA102/SK9822/HD107S, WS2801, P9813, SM16716/SM16726)");
+    Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("WiFi: connected (%s, %s)\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     } else {
         Serial.println("WiFi: not connected");
     }
-    Serial.println("Send 1 or 2 to start, or 'w' for WiFi setup. While capturing, send any key to return here.\n");
+    Serial.println();
+    Serial.println("Send 1 or 2 to start a capture, or 'w' for WiFi setup.");
+    Serial.println("While capturing, send any key to return here.");
+    Serial.println(MENU_RULE);
 }
 
 void setup() {
